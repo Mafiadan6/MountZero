@@ -25,6 +25,11 @@ LOCKFILE="/dev/mountzero_metamount_lock"
 
 echo "$LOG: metamount.sh entered (post-fs-data)" > /dev/kmsg 2>/dev/null
 
+# Ensure config.toml exists on first boot
+if [ -x "$CONFIG_SH" ]; then
+    "$CONFIG_SH" init 2>/dev/null
+fi
+
 # Bootloop guard
 COUNT=$(cat "$CONFIG_DIR/.bootcount" 2>/dev/null || echo 0)
 if [ "$COUNT" -ge 3 ]; then
@@ -162,8 +167,14 @@ if [ -n "$ABI" ] && [ -x "$MZCTL" ]; then
         "$BRIDGE_SH" write "$CONFIG_FILE" 2>/dev/null
     fi
 
-    # Step 5: Scan modules and mount via overlay + VFS
-    echo "$LOG: starting module mount pipeline (pre-zygote)" > /dev/kmsg 2>/dev/null
+    # Step 5: Read mount engine preference from config
+    MOUNT_ENGINE="vfs"
+    if [ -f "$CONFIG_FILE" ]; then
+        MOUNT_ENGINE=$("$CONFIG_SH" get mount mountEngine "vfs" 2>/dev/null || echo "vfs")
+    fi
+
+    # Step 6: Scan modules and mount
+    echo "$LOG: starting module mount pipeline (engine=$MOUNT_ENGINE) pre-zygote" > /dev/kmsg 2>/dev/null
 
     PARTITIONS="system vendor product system_ext odm odm_dlkm vendor_dlkm"
 
@@ -179,28 +190,33 @@ if [ -n "$ABI" ] && [ -x "$MZCTL" ]; then
         [ -f "${moddir}remove" ] && continue
         [ -f "${moddir}skip_mount" ] && continue
 
-        echo "$LOG: mounting module: $modid" > /dev/kmsg 2>/dev/null
+        echo "$LOG: mounting module: $modid (engine=$MOUNT_ENGINE)" > /dev/kmsg 2>/dev/null
 
-        # Try overlay mounts for each partition
-        overlay_success=0
-        for part in $PARTITIONS; do
-            if [ -d "${moddir}${part}" ]; then
-                if mount_partition_overlay "$modid" "$part" "$moddir"; then
-                    overlay_success=$((overlay_success + 1))
-                fi
-            fi
-        done
-
-        if [ $overlay_success -eq 0 ]; then
-            # Fallback to VFS path redirection
-            echo "$LOG: overlay not available, using VFS redirect for: $modid" > /dev/kmsg 2>/dev/null
+        if [ "$MOUNT_ENGINE" = "vfs" ]; then
+            # VFS mode: use path redirection (NO /proc/mounts entries, invisible to detectors)
             "$MZCTL" module install "$modid" "$moddir" 2>/dev/null
+            echo "$LOG: VFS redirect applied: $modid" > /dev/kmsg 2>/dev/null
         else
-            echo "$LOG: overlay mounted: $overlay_success partitions for: $modid" > /dev/kmsg 2>/dev/null
+            # Overlay mode: try overlay mounts first, fallback to VFS
+            overlay_success=0
+            for part in $PARTITIONS; do
+                if [ -d "${moddir}${part}" ]; then
+                    if mount_partition_overlay "$modid" "$part" "$moddir"; then
+                        overlay_success=$((overlay_success + 1))
+                    fi
+                fi
+            done
+
+            if [ $overlay_success -eq 0 ]; then
+                echo "$LOG: overlay not available, using VFS redirect for: $modid" > /dev/kmsg 2>/dev/null
+                "$MZCTL" module install "$modid" "$moddir" 2>/dev/null
+            else
+                echo "$LOG: overlay mounted: $overlay_success partitions for: $modid" > /dev/kmsg 2>/dev/null
+            fi
         fi
     done
 
-    # Step 6: Scan custom modules in /data/local/
+    # Step 7: Scan custom modules in /data/local/ (always VFS)
     for moddir in /data/local/*/; do
         [ -d "$moddir" ] || continue
         modid=$(basename "$moddir")
@@ -208,27 +224,20 @@ if [ -n "$ABI" ] && [ -x "$MZCTL" ]; then
             lost+found|tmp|media|oem|vendor|system|tests|traces) continue ;;
         esac
         echo "$LOG: mounting custom module: $modid" > /dev/kmsg 2>/dev/null
-        # Custom modules use VFS redirect (maps /data/local/X → /system)
         "$MZCTL" module install "$modid" "$moddir" custom 2>/dev/null
     done
 
-    # Step 7: Create self-bind mounts for /data/local/ modules (for /proc/mounts visibility)
-    for moddir in /data/local/*/; do
-        [ -d "$moddir" ] || continue
-        modid=$(basename "$moddir")
-        case "$modid" in
-            lost+found|tmp|media|oem|vendor|system) continue ;;
-        esac
-        mount --bind "$moddir" "$moddir" 2>/dev/null
-    done
+    # Step 8: Hide all overlay/sus mounts from non-root processes (anti-detection)
+    echo "$LOG: hiding mounts from non-root processes" > /dev/kmsg 2>/dev/null
+    $SUSFS_BIN hide_sus_mnts_for_non_su_procs 1 2>/dev/null || \
+        /data/adb/ksu/bin/ksu_susfs hide_sus_mnts_for_non_su_procs 1 2>/dev/null || true
 
     echo "$LOG: module mount pipeline complete" > /dev/kmsg 2>/dev/null
 
-    # Step 8: Apply SUSFS hiding (BRENE integration)
+    # Step 9: Apply SUSFS hiding (BRENE integration)
     if [ -x "$HIDING_SH" ]; then
         echo "$LOG: applying SUSFS hiding engine" > /dev/kmsg 2>/dev/null
-        . "$HIDING_SH"
-        apply_hiding full
+        "$HIDING_SH" full 2>/dev/null
         echo "$LOG: SUSFS hiding engine complete" > /dev/kmsg 2>/dev/null
     fi
 

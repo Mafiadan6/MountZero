@@ -15,7 +15,6 @@ fi
 
 # Unmount all mountzero overlay mounts
 grep "mountzero_" /proc/mounts 2>/dev/null | while read -r line; do
-    local mp
     mp=$(echo "$line" | awk '{print $2}')
     umount -l "$mp" 2>/dev/null
 done

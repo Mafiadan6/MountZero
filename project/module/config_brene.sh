@@ -1,0 +1,50 @@
+# MountZero VFS - BRENE-style Config (auto-generated)
+# Simple shell variables like the real BRENE module
+
+# Path Hiding
+config_paths_hiding__non_standard_sdcard=0
+config_paths_hiding__non_standard_sdcard_android=1
+config_paths_hiding__data_local_tmp=1
+config_paths_hiding__sdcard_android_data_media_obb=1
+
+# Features
+config_selinux=1
+config_su_compat=1
+config_spoof_uname=1
+config_selinux_hide=1
+config_kernel_umount=1
+config_hide_injections=1
+config_hide_suspicious_pty=1
+config_hide_custom_recovery=1
+config_enable_avc_log_spoofing=1
+config_umount_suspicious_mounts=1
+config_hide_sus_mnts_for_non_su_procs=1
+config_fix_data_local_tmp_inconsistencies=1
+config_spoof_system_properties=1
+config_spoof_system_properties_repeat=0
+config_spoof_cmdline_or_bootconfig=1
+config_hide_lsposed=1
+config_hide_loops=1
+config_hide_addon_d=0
+config_enable_log=0
+
+# Optional
+config_pif_props=0
+config_rom_props=0
+config_saturation=0
+config_brene_logs=0
+config_usb_debugging=0
+config_developer_options=0
+config_custom_spoof_uname=0
+config_wireless_debugging=0
+config_hide_lineage_strings=0
+config_spoof_libstagefright=0
+config_hide_custom_rom_paths=0
+config_hide_framework_res_apk=0
+
+# Verified Boot Hash
+config_spoof_verified_boot_hash=''
+
+# Custom Uname
+config_custom_uname_kernel_release='default'
+config_custom_uname_kernel_version='default'

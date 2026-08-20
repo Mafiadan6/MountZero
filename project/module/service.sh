@@ -9,6 +9,7 @@ BRIDGE_SH="$MODDIR/bridge.sh"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 WORK_BASE="/dev/mountzero_work"
 UPPER_BASE="/dev/mountzero_upper"
+RESETPROP="/data/adb/ksu/bin/resetprop"
 
 # ============================================================
 # Install binaries at boot (service.sh runs with full root access)
@@ -59,6 +60,11 @@ install_binaries() {
 
 install_binaries
 
+# Ensure config.toml exists (creates default if missing)
+if [ -x "$CONFIG_SH" ]; then
+    "$CONFIG_SH" init 2>/dev/null
+fi
+
 # Wait for boot to complete
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 1
@@ -93,7 +99,7 @@ fi
 # Handle ADB Root
 ADB_ROOT_ENABLED=$(cat /data/adb/mountzero/adb_root 2>/dev/null)
 if [ "$ADB_ROOT_ENABLED" = "true" ]; then
-    log "Enabling ADB root"
+    echo "mountzero: enabling ADB root" > /dev/kmsg 2>/dev/null
     setprop service.adb.root 1 2>/dev/null || /data/adb/ksu/bin/resetprop service.adb.root 1 2>/dev/null
 fi
 
@@ -101,7 +107,7 @@ fi
 # ============================================================
 # Auto-scan modules and create VFS rules at boot
 # ============================================================
-log "Scanning modules for VFS rules..."
+echo "mountzero: scanning modules for VFS rules..." > /dev/kmsg 2>/dev/null
 
 for moddir in /data/adb/modules/*/; do
     [ -d "$moddir" ] || continue
@@ -116,7 +122,7 @@ for moddir in /data/adb/modules/*/; do
             virt_path="/system${relpath}"
             $MZCTL add "$virt_path" "$filepath" 2>/dev/null
         done
-        log "  Added VFS rules for module: $MODID"
+        echo "mountzero: added VFS rules for module: $MODID" > /dev/kmsg 2>/dev/null
     fi
 done
 
@@ -127,95 +133,77 @@ for moddir in /data/local/*/; do
         lost+found|tmp|media|oem|vendor|system|tests|traces) continue ;;
     esac
     $MZCTL add "/data/local/${MODID}" "$moddir" 2>/dev/null
-    log "  Added VFS rule for custom module: $MODID"
+    echo "mountzero: added VFS rule for custom module: $MODID" > /dev/kmsg 2>/dev/null
 done
 
-log "VFS module scan complete"
-# ============================================================
-# Apply BRENE Hiding Features at Boot (based on config.toml toggles)
-# ============================================================
-HIDING_SH="$MODDIR/hiding.sh"
+echo "mountzero: VFS module scan complete" > /dev/kmsg 2>/dev/null
 
-# Helper to read config values
-get_config() {
-    local section="$1" key="$2" default="$3"
-    # Wait a moment for filesystem to settle
-    sleep 1
-    if [ -f "$CONFIG_FILE" ]; then
-        local val=$(grep -A50 "^\[$section\]" "$CONFIG_FILE" 2>/dev/null | grep "^$key" | head -1 | cut -d'=' -f2 | tr -d ' "\r\n')
-        echo "${val:-$default}"
-    else
-        echo "$default"
+# ============================================================
+# Replay excluded UIDs from persistence
+# ============================================================
+EXCLUSION_FILE="$CONFIG_DIR/.exclusion_list"
+if [ -f "$EXCLUSION_FILE" ]; then
+    while IFS= read -r uid; do
+        uid=$(echo "$uid" | tr -d '[:space:]')
+        [ -z "$uid" ] && continue
+        $MZCTL block "$uid" 2>/dev/null
+        echo "mountzero: replayed UID exclusion: $uid" > /dev/kmsg 2>/dev/null
+    done < "$EXCLUSION_FILE"
+fi
+
+# ============================================================
+# BRENE-compatible Root Hiding (boot-completed stage)
+# Runs in background to not block hot-plug daemon
+# ============================================================
+
+(
+    # Sync WebUI config → BRENE shell variables
+    if [ -x "$CONFIG_SH" ]; then
+        "$CONFIG_SH" init 2>/dev/null
     fi
-}
 
-# Apply hiding features at boot - based on WebUI config toggles
-# Only applies if user has enabled those features in the WebUI settings
+    # Read config.toml for per-phase toggles
+    CFG="$CONFIG_DIR/config.toml"
+    _get_cfg() {
+        local sec="$1" key="$2" def="$3"
+        [ -f "$CFG" ] || { echo "$def"; return; }
+        awk -F'=' -v sec="$sec" -v key="$key" -v def="$def" '
+            /^\[/ { in_sec = (substr($0, 2, length($0)-2) == sec) ? 1 : 0; next }
+            in_sec && $1 ~ "^ *"key" *$" { gsub(/^[ ]+|[ ]+$/, "", $2); gsub(/^["'"'"']|["'"'"']$/, "", $2); print $2; exit }
+            END { if (!found) print def }
+        ' "$CFG"
+    }
 
-# Check each config option and apply if enabled (matching WebUI saved keys)
-if [ "$(get_config brene nonStandardSdcardPathsHiding false)" = "true" ]; then
-    $MODDIR/hiding.sh sdcard 2>/dev/null &
-fi
+    _hide_paths=$(_get_cfg ghost hidePaths true)
+    _hide_spoof=$(_get_cfg ghost hideSpoof true)
+    _hide_mounts=$(_get_cfg ghost kernelUmount true)
+    _hide_lsposed=$(_get_cfg ghost hideLsposed false)
+    _hide_loops=$(_get_cfg ghost hideLoops true)
+    _hide_sdcard=$(_get_cfg ghost nonStandardSdcardPathsHiding false)
+    _hide_sdcard_android=$(_get_cfg ghost nonStandardSdcardAndroidPathsHiding false)
+    _hide_injections=$(_get_cfg ghost autoHideInjections true)
+    _hide_recovery=$(_get_cfg ghost hideRecovery true)
+    _hide_cleanup=$(_get_cfg ghost cleanupLeftovers false)
+    _hide_inotify=$(_get_cfg ghost inotifyWatcher false)
+    _hide_selinux=$(_get_cfg ghost selinuxEnforce false)
 
-if [ "$(get_config brene hideModuleInjections false)" = "true" ]; then
-    $MODDIR/hiding.sh injections 2>/dev/null &
-fi
-
-if [ "$(get_config brene hideRecovery false)" = "true" ]; then
-    $MODDIR/hiding.sh recovery 2>/dev/null &
-fi
-
-if [ "$(get_config brene nonStandardSdcardAndroidPathsHiding false)" = "true" ]; then
-    $MODDIR/hiding.sh sdcard 2>/dev/null &
-fi
-
-if [ "$(get_config brene hideAndroidData false)" = "true" ]; then
-    $MODDIR/hiding.sh sdcard 2>/dev/null &
-fi
-
-if [ "$(get_config brene zygiskAutoScan false)" = "true" ]; then
-    $MODDIR/hiding.sh injections 2>/dev/null &
-fi
-
-if [ "$(get_config brene unameSpoofing false)" = "true" ]; then
-    $MODDIR/hiding.sh spoof 2>/dev/null &
-fi
-
-if [ "$(get_config brene selinux false)" = "true" ]; then
-    $MODDIR/hiding.sh selinux 2>/dev/null &
-fi
-
-if [ "$(get_config brene cleanupLeftovers false)" = "true" ]; then
-    $MODDIR/hiding.sh cleanup 2>/dev/null &
-fi
-
-if [ "$(get_config brene inotifyWatcher false)" = "true" ]; then
-    $MODDIR/hiding.sh inotify 2>/dev/null &
-fi
-
-if [ "$(get_config brene spoofKernel false)" = "true" ]; then
-    $MODDIR/hiding.sh spoof 2>/dev/null &
-fi
-
-# Apply recovery paths hiding if enabled (default: false)
-if [ "$(get_config brene hideRecovery false)" = "true" ]; then
-    $HIDING_SH recovery 2>/dev/null &
-fi
-
-# Apply leftover cleanup if enabled (default: false)
-if [ "$(get_config brene cleanupLeftovers false)" = "true" ]; then
-    $HIDING_SH cleanup 2>/dev/null &
-fi
-
-# Start inotify watcher if enabled (default: false)
-if [ "$(get_config brene inotifyWatcher false)" = "true" ]; then
-    $HIDING_SH inotify 2>/dev/null &
-fi
-
-# Apply SELinux enforcement if enabled
-if [ "$(get_config brene selinuxEnforce false)" = "true" ]; then
-    $HIDING_SH selinux 2>/dev/null &
-fi
+    # Apply hiding phases based on config
+    if [ -f "$MODDIR/hiding.sh" ]; then
+        chmod 755 "$MODDIR/hiding.sh"
+        [ "$_hide_paths" = "true" ] && "$MODDIR/hiding.sh" paths 2>/dev/null
+        [ "$_hide_spoof" = "true" ] && "$MODDIR/hiding.sh" spoof 2>/dev/null
+        [ "$_hide_mounts" = "true" ] && "$MODDIR/hiding.sh" mounts 2>/dev/null
+        [ "$_hide_lsposed" = "true" ] && "$MODDIR/hiding.sh" lsposed 2>/dev/null
+        [ "$_hide_loops" = "true" ] && "$MODDIR/hiding.sh" loops 2>/dev/null
+        [ "$_hide_sdcard" = "true" ] || [ "$_hide_sdcard_android" = "true" ] && "$MODDIR/hiding.sh" sdcard 2>/dev/null
+        [ "$_hide_injections" = "true" ] && "$MODDIR/hiding.sh" injections 2>/dev/null
+        [ "$_hide_recovery" = "true" ] && "$MODDIR/hiding.sh" recovery 2>/dev/null
+        [ "$_hide_cleanup" = "true" ] && "$MODDIR/hiding.sh" cleanup 2>/dev/null
+        [ "$_hide_inotify" = "true" ] && "$MODDIR/hiding.sh" inotify 2>/dev/null
+        [ "$_hide_selinux" = "true" ] && "$MODDIR/hiding.sh" selinux 2>/dev/null
+        echo "mountzero: hiding phases applied at boot (paths=$_hide_paths spoof=$_hide_spoof mounts=$_hide_mounts lsposed=$_hide_lsposed loops=$_hide_loops sdcard=$_hide_sdcard injections=$_hide_injections recovery=$_hide_recovery cleanup=$_hide_cleanup inotify=$_hide_inotify selinux=$_hide_selinux)" > /dev/kmsg 2>/dev/null
+    fi
+) &
 
 # Function: Unmount a module's overlay partitions
 unmount_module_overlays() {

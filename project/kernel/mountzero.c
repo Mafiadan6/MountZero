@@ -1,1422 +1,1385 @@
-/*
- * MountZero - Core Implementation (Enhanced)
- *
- * Full VFS path redirection, SUSFS bridge, container support,
- * bootloop guard, and module auto-scanning system.
- * Works alongside SUSFS to provide automatic module mounting at boot.
- * Equivalent to ZeroMount kernel driver with enhancements.
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/path.h>
 #include <linux/namei.h>
-#include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/uaccess.h>
-#include <linux/dirent.h>
-#include <linux/miscdevice.h>
 #include <linux/cred.h>
-#include <linux/vmalloc.h>
-#include <linux/mm.h>
-#include <linux/mountzero.h>
-#include <linux/mountzero_def.h>
-#include <linux/spinlock.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
 #include <linux/statfs.h>
-#include <linux/file.h>
 #include <linux/fs_struct.h>
-#include <linux/reboot.h>
-#include <linux/bitmap.h>
-#include <linux/mount.h>
-#include <linux/kthread.h>
-#include <linux/delay.h>
-#include <linux/workqueue.h>
-#include <linux/xattr.h>
-#include <linux/security.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/input.h>
+#include <linux/version.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
+#include <linux/mountzero.h>
 
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs.h>
-#include <linux/susfs_def.h>
-#endif
+static struct kmem_cache *mz_rule_cachep, *mz_dir_cachep, *mz_uid_cachep;
+atomic_t mz_active_rules = ATOMIC_INIT(0);
+atomic_t mz_active_dirs = ATOMIC_INIT(0);
+atomic_t mz_active_uids = ATOMIC_INIT(0);
+DEFINE_STATIC_KEY_FALSE(mountzero_active_rules);
+DEFINE_STATIC_KEY_FALSE(mountzero_active_dirs);
+DEFINE_STATIC_KEY_FALSE(mountzero_active_uids);
 
-#define MOUNTZERO_VERSION "2.0.0-MZ"
-#define MOUNTZERO_HASH_BITS 10
-#define MZ_BLOOM_BITS 8192
-#define MZ_BLOOM_MASK (MZ_BLOOM_BITS - 1)
+/* logs */
+#define mz_debug(fmt, ...) printk(KERN_DEBUG "MountZero: [DEBUG] " fmt, ##__VA_ARGS__)
+#define mz_info(fmt, ...) printk(KERN_INFO "MountZero: " fmt, ##__VA_ARGS__)
+#define mz_warn(fmt, ...) printk(KERN_WARNING "MountZero: [WARN] " fmt, ##__VA_ARGS__)
+#define mz_err(fmt, ...)  printk(KERN_ERR "MountZero: [ERROR] " fmt, ##__VA_ARGS__)
 
-/* ============================================================
- * Global State
- * ============================================================ */
+/*** Verification & Compatibility Checks ***/
 
-int mountzero_debug_level = 0;
-atomic_t mountzero_enabled = ATOMIC_INIT(0);
-EXPORT_SYMBOL(mountzero_enabled);
-EXPORT_SYMBOL(mountzero_debug_level);
-
-/* VFS engine statistics */
-static atomic_t mz_rule_count = ATOMIC_INIT(0);
-static atomic_t mz_hidden_path_count = ATOMIC_INIT(0);
-static atomic_t mz_hidden_maps_count = ATOMIC_INIT(0);
-static atomic_t mz_excluded_uid_count = ATOMIC_INIT(0);
-
-/* Bootloop guard */
-static atomic_t mz_bootloop_count = ATOMIC_INIT(0);
-static bool mz_guard_tripped = false;
-static int mz_bootloop_threshold = 3;
-
-/* Hidden paths for SUSFS */
-#define MZ_MAX_HIDDEN_PATHS 64
-static char *mz_hidden_paths[MZ_MAX_HIDDEN_PATHS];
-static int mz_hidden_path_count_int = 0;
-static DEFINE_MUTEX(mz_hidden_mutex);
-
-/* Hash tables for rules */
-DEFINE_HASHTABLE(mz_redirect_rules_ht, MOUNTZERO_HASH_BITS);
-EXPORT_SYMBOL(mz_redirect_rules_ht);
-DEFINE_HASHTABLE(mz_bind_rules_ht, MOUNTZERO_HASH_BITS);
-DEFINE_HASHTABLE(mz_hide_rules_ht, MOUNTZERO_HASH_BITS);
-DEFINE_HASHTABLE(mz_sus_path_ht, MOUNTZERO_HASH_BITS);
-DEFINE_HASHTABLE(mz_sus_map_ht, MOUNTZERO_HASH_BITS);
-DEFINE_HASHTABLE(mz_ino_ht, MOUNTZERO_HASH_BITS);
-
-DEFINE_SPINLOCK(mz_lock);
-EXPORT_SYMBOL(mz_lock);
-static DECLARE_BITMAP(mz_bloom, MZ_BLOOM_BITS);
-
-/* Excluded UIDs */
-static DECLARE_BITMAP(mz_excluded_uids, 20000);
-static DEFINE_MUTEX(mz_uid_mutex);
-
-/* Module: Bootloop Guard */
-static struct kobject *mz_guard_kobj;
-
-/* ============================================================
- * Sysfs Interface
- * ============================================================ */
-
-static ssize_t mz_version_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sysfs_emit(buf, "%s\n", MOUNTZERO_VERSION);
-}
-
-static ssize_t mz_status_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sysfs_emit(buf, "enabled=%d\nrules=%d\nhidden_paths=%d\nhidden_maps=%d\nexcluded_uids=%d\nbootloop_count=%d\nguard_tripped=%d\n",
-                      atomic_read(&mountzero_enabled),
-                      atomic_read(&mz_rule_count),
-                      atomic_read(&mz_hidden_path_count),
-                      atomic_read(&mz_hidden_maps_count),
-                      atomic_read(&mz_excluded_uid_count),
-                      atomic_read(&mz_bootloop_count),
-                      mz_guard_tripped ? 1 : 0);
-}
-
-static ssize_t mz_debug_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sysfs_emit(buf, "%d\n", mountzero_debug_level);
-}
-
-static ssize_t mz_debug_store(struct kobject *kobj, struct kobj_attribute *attr,
-                               const char *buf, size_t count)
-{
-    int level;
-    if (kstrtoint(buf, 10, &level) == 0) {
-        mountzero_debug_level = clamp(level, 0, 2);
-        pr_info("MountZero: Debug level set to %d\n", mountzero_debug_level);
-    }
-    return count;
-}
-
-static ssize_t mz_guard_count_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sysfs_emit(buf, "%d\n", atomic_read(&mz_bootloop_count));
-}
-
-static ssize_t mz_guard_count_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                     const char *buf, size_t count)
-{
-    int val;
-    if (kstrtoint(buf, 10, &val) == 0) {
-        atomic_set(&mz_bootloop_count, val);
-        pr_info("MountZero: Bootloop count set to %d\n", val);
-    }
-    return count;
-}
-
-static ssize_t mz_guard_threshold_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-{
-    return sysfs_emit(buf, "%d\n", mz_bootloop_threshold);
-}
-
-static ssize_t mz_guard_threshold_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                         const char *buf, size_t count)
-{
-    int val;
-    if (kstrtoint(buf, 10, &val) == 0) {
-        mz_bootloop_threshold = clamp(val, 1, 10);
-        pr_info("MountZero: Bootloop threshold set to %d\n", mz_bootloop_threshold);
-    }
-    return count;
-}
-
-static struct kobj_attribute mz_version_attr = __ATTR_RO(mz_version);
-static struct kobj_attribute mz_status_attr = __ATTR_RO(mz_status);
-static struct kobj_attribute mz_debug_attr = __ATTR_RW(mz_debug);
-static struct kobj_attribute mz_guard_count_attr = __ATTR_RW(mz_guard_count);
-static struct kobj_attribute mz_guard_threshold_attr = __ATTR_RW(mz_guard_threshold);
-
-static struct attribute *mz_attrs[] = {
-    &mz_version_attr.attr,
-    &mz_status_attr.attr,
-    &mz_debug_attr.attr,
-    NULL,
-};
-
-static struct attribute *mz_guard_attrs[] = {
-    &mz_guard_count_attr.attr,
-    &mz_guard_threshold_attr.attr,
-    NULL,
-};
-
-static struct attribute_group mz_attr_group = {
-    .attrs = mz_attrs,
-};
-
-static struct attribute_group mz_guard_attr_group = {
-    .attrs = mz_guard_attrs,
-};
-
-/* ============================================================
- * Bloom Filter Helpers
- * ============================================================ */
-
-static inline void mz_bloom_add(u32 hash)
-{
-    set_bit(hash & MZ_BLOOM_MASK, mz_bloom);
-    set_bit((hash >> 10) & MZ_BLOOM_MASK, mz_bloom);
-    set_bit((hash >> 20) & MZ_BLOOM_MASK, mz_bloom);
-}
-
-static inline bool mz_bloom_test(u32 hash)
-{
-    return test_bit(hash & MZ_BLOOM_MASK, mz_bloom) &&
-           test_bit((hash >> 10) & MZ_BLOOM_MASK, mz_bloom) &&
-           test_bit((hash >> 20) & MZ_BLOOM_MASK, mz_bloom);
-}
-
-/* ============================================================
- * Path Resolution
- * ============================================================ */
-
-static inline u32 mz_hash_string(const char *str)
-{
-    u32 hash = 0;
-    if (!str)
-        return 0;
-
-    while (*str) {
-        hash += *str++;
-        hash += (hash << 10);
-        hash ^= (hash >> 6);
-    }
-    hash += (hash << 3);
-    hash ^= (hash >> 11);
-    hash += (hash << 15);
-    return hash;
-}
-
-bool mountzero_should_redirect(const char *path)
-{
-    struct mz_rule *rule;
-    u32 hash;
-    unsigned long irq_flags;
-    bool found = false;
-
-    if (atomic_read(&mountzero_enabled) == 0 || !path)
-        return false;
-
-    hash = mz_hash_string(path);
-
-    if (!mz_bloom_test(hash))
-        return false;
-
-    spin_lock_irqsave(&mz_lock, irq_flags);
-    hash_for_each_possible(mz_redirect_rules_ht, rule, node, hash) {
-        if (rule->hash == hash && strcmp(rule->virtual_path, path) == 0) {
-            found = true;
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-    return found;
-}
-EXPORT_SYMBOL(mountzero_should_redirect);
-
-char *mountzero_resolve_path(const char *path)
-{
-    struct mz_rule *rule;
-    u32 hash;
-    unsigned long irq_flags;
-    char *resolved = NULL;
-
-    if (!path)
-        return NULL;
-
-    hash = mz_hash_string(path);
-
-    if (!mz_bloom_test(hash))
-        return NULL;
-
-    spin_lock_irqsave(&mz_lock, irq_flags);
-    hash_for_each_possible(mz_redirect_rules_ht, rule, node, hash) {
-        if (rule->hash == hash && strcmp(rule->virtual_path, path) == 0) {
-            resolved = kstrdup(rule->real_path, GFP_ATOMIC);
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-    return resolved;
-}
-EXPORT_SYMBOL(mountzero_resolve_path);
-
-/* Reverse lookup: map real inode back to virtual path */
-char *mountzero_get_static_vpath(struct inode *inode)
-{
-    struct mz_rule *rule;
-    unsigned long key;
-    unsigned long irq_flags;
-    char *copy = NULL;
-
-    if (unlikely(!inode || !inode->i_sb))
-        return NULL;
-
-    if (atomic_read(&mountzero_enabled) == 0)
-        return NULL;
-
-    key = inode->i_ino ^ inode->i_sb->s_dev;
-
-    spin_lock_irqsave(&mz_lock, irq_flags);
-    hash_for_each_possible(mz_ino_ht, rule, ino_node, key) {
-        if (rule->real_ino == inode->i_ino &&
-            rule->real_dev == inode->i_sb->s_dev &&
-            (rule->flags & MZ_FLAG_READ_ONLY)) {
-            copy = kstrdup(rule->virtual_path, GFP_ATOMIC);
-            break;
-        }
-    }
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-    return copy;
-}
-EXPORT_SYMBOL(mountzero_get_static_vpath);
-
-/* ============================================================
- * SUSFS Bridge - Full Integration
+/**
+ * mountzero_is_uid_blocked - Check if a specific UID is excluded from redirection
+ * @uid: The User ID to check
  *
- * NOTE: This kernel's SUSFS API uses void __user **user_info
- * (struct-based IOCTL calls). Direct kernel calls are not supported.
- * The SUSFS bridge here provides the interface for userspace tools
- * (ksu_susfs CLI) to call via IOCTL. Kernel-internal SUSFS ops
- * are done by the userspace bridge.sh script.
- * ============================================================ */
-
-#ifdef CONFIG_KSU_SUSFS
-
-/* ============================================================
- * Direct Uname Spoofing — modifies utsname() directly
- * Bypasses SUSFS supercall limitation for custom values.
- * Users can spoof release/version and reset to stock anytime.
- * ============================================================ */
-
-#include <linux/utsname.h>
-#include <linux/semaphore.h>
-
-/* Stock kernel version saved at boot */
-static char mz_stock_release[__NEW_UTS_LEN + 1] = {0};
-static char mz_stock_version[__NEW_UTS_LEN + 1] = {0};
-static bool mz_stock_saved = false;
-
-/* Currently spoofed values (empty = using stock) */
-static char mz_spoofed_release[__NEW_UTS_LEN + 1] = {0};
-static char mz_spoofed_version[__NEW_UTS_LEN + 1] = {0};
-static DEFINE_MUTEX(mz_uname_mutex);
-
-/* Save original kernel version at init */
-static void mz_save_stock_uname(void)
-{
-    down_read(&uts_sem);
-    strscpy(mz_stock_release, utsname()->release, sizeof(mz_stock_release));
-    strscpy(mz_stock_version, utsname()->version, sizeof(mz_stock_version));
-    up_read(&uts_sem);
-    mz_stock_saved = true;
-    pr_info("MountZero: Saved stock uname: release='%s', version='%s'\n",
-            mz_stock_release, mz_stock_version);
-}
-
-/* Apply custom uname spoofing */
-int mountzero_do_spoof_uname(const char *release, const char *version)
-{
-    if (!release || !version || !*release || !*version)
-        return -EINVAL;
-
-    mutex_lock(&mz_uname_mutex);
-
-    /* Save stock if not already saved */
-    if (!mz_stock_saved)
-        mz_save_stock_uname();
-
-    /* Apply new values */
-    strscpy(mz_spoofed_release, release, sizeof(mz_spoofed_release));
-    strscpy(mz_spoofed_version, version, sizeof(mz_spoofed_version));
-
-    /* Write to kernel utsname */
-    down_write(&uts_sem);
-    strscpy(utsname()->release, release, sizeof(utsname()->release));
-    strscpy(utsname()->version, version, sizeof(utsname()->version));
-    up_write(&uts_sem);
-
-    mutex_unlock(&mz_uname_mutex);
-
-    pr_info("MountZero: Uname spoofed: release='%s', version='%s'\n",
-            release, version);
-    return 0;
-}
-EXPORT_SYMBOL(mountzero_do_spoof_uname);
-
-/* Reset to stock kernel version */
-int mountzero_reset_uname(void)
-{
-    mutex_lock(&mz_uname_mutex);
-
-    if (!mz_stock_saved) {
-        mutex_unlock(&mz_uname_mutex);
-        return -ENODATA; /* Stock not saved */
-    }
-
-    /* Clear spoofed values */
-    mz_spoofed_release[0] = '\0';
-    mz_spoofed_version[0] = '\0';
-
-    /* Restore stock values */
-    down_write(&uts_sem);
-    strscpy(utsname()->release, mz_stock_release, sizeof(utsname()->release));
-    strscpy(utsname()->version, mz_stock_version, sizeof(utsname()->version));
-    up_write(&uts_sem);
-
-    mutex_unlock(&mz_uname_mutex);
-
-    pr_info("MountZero: Uname reset to stock: release='%s', version='%s'\n",
-            mz_stock_release, mz_stock_version);
-    return 0;
-}
-EXPORT_SYMBOL(mountzero_reset_uname);
-
-/* Query current spoof status */
-int mountzero_get_uname_status(char *buf, size_t len)
-{
-    int ret;
-
-    mutex_lock(&mz_uname_mutex);
-
-    if (mz_spoofed_release[0] != '\0') {
-        ret = snprintf(buf, len,
-            "spoofed=1\nrelease=%s\nversion=%s\nstock_release=%s\nstock_version=%s\n",
-            mz_spoofed_release, mz_spoofed_version,
-            mz_stock_saved ? mz_stock_release : "unknown",
-            mz_stock_saved ? mz_stock_version : "unknown");
-    } else {
-        ret = snprintf(buf, len,
-            "spoofed=0\nrelease=%s\nversion=%s\n",
-            mz_stock_saved ? mz_stock_release : utsname()->release,
-            mz_stock_saved ? mz_stock_version : utsname()->version);
-    }
-
-    mutex_unlock(&mz_uname_mutex);
-    return ret;
-}
-EXPORT_SYMBOL(mountzero_get_uname_status);
-
-/* SUSFS pass-through stubs (actual work done by ksu_susfs CLI) */
-int mountzero_susfs_add_path(const char *path) { return 0; }
-int mountzero_susfs_add_path_loop(const char *path) { return 0; }
-int mountzero_susfs_add_kstat(const char *path) { return 0; }
-int mountzero_susfs_update_kstat(const char *path) { return 0; }
-int mountzero_susfs_add_map(const char *path) { return 0; }
-int mountzero_susfs_set_uname(const char *release, const char *version) { return 0; }
-int mountzero_susfs_set_cmdline(const char *path) { return 0; }
-int mountzero_susfs_hide_mounts(bool enable) { return 0; }
-int mountzero_susfs_enable_log(bool enable) { return 0; }
-int mountzero_susfs_enable_avc_log_spoofing(bool enable) { return 0; }
-int mountzero_susfs_get_version(char *buf, size_t len) {
-    if (buf && len > 0) snprintf(buf, len, "v2.1.0");
-    return 0;
-}
-int mountzero_susfs_get_features(char *buf, size_t len) {
-    if (buf && len > 0) {
-        snprintf(buf, len,
-            "sus_path:%d sus_mount:%d sus_kstat:%d spoof_uname:%d "
-            "enable_log:%d spoof_cmdline:%d sus_map:%d",
-            IS_ENABLED(CONFIG_KSU_SUSFS_SUS_PATH) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_SUS_MOUNT) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_SUS_KSTAT) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_SPOOF_UNAME) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_ENABLE_LOG) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG) ? 1 : 0,
-            IS_ENABLED(CONFIG_KSU_SUSFS_SUS_MAP) ? 1 : 0);
-    }
-    return 0;
-}
-EXPORT_SYMBOL(mountzero_susfs_add_path);
-EXPORT_SYMBOL(mountzero_susfs_add_path_loop);
-EXPORT_SYMBOL(mountzero_susfs_add_kstat);
-EXPORT_SYMBOL(mountzero_susfs_update_kstat);
-EXPORT_SYMBOL(mountzero_susfs_add_map);
-EXPORT_SYMBOL(mountzero_susfs_set_uname);
-EXPORT_SYMBOL(mountzero_susfs_set_cmdline);
-EXPORT_SYMBOL(mountzero_susfs_hide_mounts);
-EXPORT_SYMBOL(mountzero_susfs_enable_log);
-EXPORT_SYMBOL(mountzero_susfs_enable_avc_log_spoofing);
-EXPORT_SYMBOL(mountzero_susfs_get_version);
-EXPORT_SYMBOL(mountzero_susfs_get_features);
-
-#endif /* CONFIG_KSU_SUSFS */
-
-/* ============================================================
- * Rule Management
- * ============================================================ */
-
-int mountzero_add_redirect(const char *virtual_path, const char *real_path, unsigned int flags)
-{
-    struct mz_rule *rule;
-    u32 hash;
-    unsigned long irq_flags;
-
-    if (!virtual_path || !real_path)
-        return -EINVAL;
-
-    rule = kmalloc(sizeof(*rule), GFP_KERNEL);
-    if (!rule)
-        return -ENOMEM;
-
-    memset(rule, 0, sizeof(*rule));
-
-    rule->virtual_path = kstrdup(virtual_path, GFP_KERNEL);
-    rule->real_path = kstrdup(real_path, GFP_KERNEL);
-    if (!rule->virtual_path || !rule->real_path) {
-        kfree(rule->virtual_path);
-        kfree(rule->real_path);
-        kfree(rule);
-        return -ENOMEM;
-    }
-
-    rule->flags = flags;
-    hash = mz_hash_string(virtual_path);
-    rule->hash = hash;
-
-    /* Get real file inode for reverse mapping */
-    {
-        struct path path;
-        int ret = kern_path(real_path, LOOKUP_FOLLOW, &path);
-        if (ret == 0) {
-            struct inode *inode = d_backing_inode(path.dentry);
-            if (inode) {
-                rule->real_ino = inode->i_ino;
-                rule->real_dev = inode->i_sb->s_dev;
-                rule->v_ino = inode->i_ino;
-                rule->v_dev = inode->i_sb->s_dev;
-
-                /* Add to inode hash table for reverse lookup */
-                unsigned long ino_key = inode->i_ino ^ inode->i_sb->s_dev;
-                spin_lock_irqsave(&mz_lock, irq_flags);
-                hash_add(mz_ino_ht, &rule->ino_node, ino_key);
-                spin_unlock_irqrestore(&mz_lock, irq_flags);
-            }
-            path_put(&path);
+ * Returns true if the UID exists in the exclusion hash table.
+ */
+static inline bool mountzero_is_uid_blocked(uid_t uid) {
+    struct mountzero_uid_node *entry;
+    rcu_read_lock();
+    hash_for_each_possible_rcu(mountzero_uid_ht, entry, node, uid) {
+        if (entry->uid == uid) {
+            rcu_read_unlock();
+            return true;
         }
     }
-
-    spin_lock_irqsave(&mz_lock, irq_flags);
-    hash_add(mz_redirect_rules_ht, &rule->node, hash);
-    mz_bloom_add(hash);
-    atomic_inc(&mz_rule_count);
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-    if (mountzero_debug_level > 0)
-        pr_info("MountZero: Added redirect: %s -> %s\n", virtual_path, real_path);
-
-    return 0;
+    rcu_read_unlock();
+    return false;
 }
-EXPORT_SYMBOL(mountzero_add_redirect);
 
-int mountzero_del_redirect(const char *virtual_path)
-{
-    struct mz_rule *rule;
-    u32 hash;
-    unsigned long irq_flags;
-    int found = 0;
+/**
+ * __mountzero_should_skip - Determine if the current context should bypass hooks
+ *
+ * Returns true if MountZero is disabled, if running in interrupt context,
+ * if recursion is detected, or if the current UID is in the blocklist.
+ */
+static __always_inline bool __mountzero_should_skip(void) {
+    if (!static_branch_unlikely(&mountzero_active_rules)) return true;
+    if (unlikely(!in_task() || in_nmi() || oops_in_progress)) return true;
+    if (unlikely(current->flags & (PF_KTHREAD | PF_EXITING))) return true;
+    if (unlikely(static_branch_unlikely(&mountzero_active_uids))) {
+        if (unlikely(mountzero_is_uid_blocked(current_uid().val))) return true;
+    }
+    return false;
+}
 
-    if (!virtual_path)
-        return -EINVAL;
+/*** Helpers & Path Resolution ***/
 
-    hash = mz_hash_string(virtual_path);
+/**
+ * __mountzero_is_injected_file_rcu - Check if an inode number belongs to an injected file.
+ * @inode: The inode to check
+ *
+ * This function performs a lockless check against the registered rules to determine
+ * if the given inode corresponds to an injected file.
+ * It checks both real and virtual inode hash tables.
+ *
+ * NOTE: The caller MUST hold rcu_read_lock() before calling this function
+ * and keep it held as long as the result is being used.
+ */
+static inline bool __mountzero_is_injected_file_rcu(struct inode *inode) {
+    struct mz_inode_node *node;
+    hash_for_each_possible_rcu(mountzero_inodes_ht, node, node, inode->i_ino) {
+        if (node->ino == inode->i_ino && node->dev == inode->i_sb->s_dev) {
+            if (node->type & (MZ_INO_TYPE_REAL | MZ_INO_TYPE_VIRTUAL))
+                return true;
+        }
+    }
+    return false;
+}
 
-    spin_lock_irqsave(&mz_lock, irq_flags);
-    hash_for_each_possible(mz_redirect_rules_ht, rule, node, hash) {
-        if (rule->hash == hash && strcmp(rule->virtual_path, virtual_path) == 0) {
-            hash_del(&rule->node);
-            /* Also remove from inode hash table */
-            if (!hlist_unhashed(&rule->ino_node))
-                hash_del(&rule->ino_node);
-            kfree(rule->virtual_path);
-            kfree(rule->real_path);
-            kfree(rule);
-            atomic_dec(&mz_rule_count);
-            found = 1;
+/**
+ * __mountzero_is_traversal_allowed_rcu - Check if an inode number corresponds to a 
+ * directory with traversal permissions
+ * @inode: The inode to check
+ *
+ * This function checks if the given inode corresponds to a directory that allows traversal.
+ *
+ * NOTE: The caller MUST hold rcu_read_lock() before calling this function
+ * and keep it held as long as the result is being used.
+ */
+static inline bool __mountzero_is_traversal_allowed_rcu(struct inode *inode) {
+    struct mz_inode_node *node;
+    hash_for_each_possible_rcu(mountzero_inodes_ht, node, node, inode->i_ino) {
+        if (node->ino == inode->i_ino && node->dev == inode->i_sb->s_dev) {
+            if (likely(node->type & MZ_INO_TYPE_DIR)) return true;
             break;
         }
     }
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-    if (!found)
-        return -ENOENT;
-
-    pr_info("MountZero: Deleted redirect rule: %s\n", virtual_path);
-    return 0;
+    return false;
 }
-EXPORT_SYMBOL(mountzero_del_redirect);
 
-/* ============================================================
- * UID Exclusion
- * ============================================================ */
-
-int mountzero_block_uid(uid_t uid)
+/**
+ * mountzero_build_path_from_pwd - Construct an absolute path using the current working directory
+ * @rel_name: The relative filename to append to the current working directory
+ * @name_len: The length of the relative filename
+ * @out_len: Pointer to receive the length of the constructed path
+ * @out_path: Pointer to receive the allocated path string
+ * @fast_buf: Pointer to a pre-allocated stack buffer for fast path resolution
+ *
+ * This helper is used to reconstruct an absolute path for operations that provide
+ * a relative filename, ensuring that MountZero can still resolve the intended target.
+ *
+ * This helper uses a fast stack buffer for common path sizes.
+ * If the path exceeds the fast buffer, it allocates a full page from names_cache.
+ * Returns a pointer to the buffer holding the path (fast_buf or a new page).
+ * If a new page is returned, it must be freed with __putname().
+ */
+static const char *mountzero_build_path_from_pwd(const char *rel_name, size_t name_len, size_t *out_len,
+                                                const char **out_path, char *fast_buf)
 {
-    if (uid >= 20000)
-        return -EINVAL;
+    struct path pwd;
+    char *end_ptr, *cwd_str, *page_buf = fast_buf;
+    size_t dir_len;
 
-    mutex_lock(&mz_uid_mutex);
-    set_bit(uid, mz_excluded_uids);
-    atomic_inc(&mz_excluded_uid_count);
-    mutex_unlock(&mz_uid_mutex);
+    rcu_read_lock();
+    pwd = current->fs->pwd;
+    path_get(&pwd);
+    rcu_read_unlock();
+    cwd_str = d_path(&pwd, page_buf, 512);
 
-    pr_info("MountZero: Blocked UID %d\n", uid);
-    return 0;
-}
-EXPORT_SYMBOL(mountzero_block_uid);
-
-int mountzero_unblock_uid(uid_t uid)
-{
-    if (uid >= 20000)
-        return -EINVAL;
-
-    mutex_lock(&mz_uid_mutex);
-    clear_bit(uid, mz_excluded_uids);
-    atomic_dec(&mz_excluded_uid_count);
-    mutex_unlock(&mz_uid_mutex);
-
-    return 0;
-}
-EXPORT_SYMBOL(mountzero_unblock_uid);
-
-bool mountzero_is_uid_excluded(uid_t uid)
-{
-    bool excluded;
-
-    if (uid >= 20000)
-        return false;
-
-    mutex_lock(&mz_uid_mutex);
-    excluded = test_bit(uid, mz_excluded_uids);
-    mutex_unlock(&mz_uid_mutex);
-
-    return excluded;
-}
-EXPORT_SYMBOL(mountzero_is_uid_excluded);
-
-/* ============================================================
- * Hidden Paths Management
- * ============================================================ */
-
-int mountzero_add_hidden_path(const char *path)
-{
-    int ret = -ENOSPC;
-
-    mutex_lock(&mz_hidden_mutex);
-    if (mz_hidden_path_count_int < MZ_MAX_HIDDEN_PATHS) {
-        mz_hidden_paths[mz_hidden_path_count_int] = kstrdup(path, GFP_KERNEL);
-        if (mz_hidden_paths[mz_hidden_path_count_int]) {
-            mz_hidden_path_count_int++;
-            atomic_inc(&mz_hidden_path_count);
-            ret = 0;
-            pr_info("MountZero: Added hidden path: %s\n", path);
+    if (IS_ERR(cwd_str)) {
+        if (PTR_ERR(cwd_str) == -ENAMETOOLONG) {
+            page_buf = __getname();
+            if (unlikely(!page_buf)) { path_put(&pwd); return NULL; }
+            cwd_str = d_path(&pwd, page_buf, PATH_MAX);
+            if (IS_ERR(cwd_str)) { __putname(page_buf); path_put(&pwd); return NULL; }
         } else {
-            ret = -ENOMEM;
+            path_put(&pwd);
+            return NULL;
         }
     }
-    mutex_unlock(&mz_hidden_mutex);
+    path_put(&pwd);
 
-    return ret;
-}
-EXPORT_SYMBOL(mountzero_add_hidden_path);
-
-int mountzero_clear_hidden_paths(void)
-{
-    int i;
-
-    mutex_lock(&mz_hidden_mutex);
-    for (i = 0; i < mz_hidden_path_count_int; i++) {
-        kfree(mz_hidden_paths[i]);
-        mz_hidden_paths[i] = NULL;
+    dir_len = strlen(cwd_str);
+    if (likely(dir_len + name_len + 2 <= (page_buf != fast_buf ? PATH_MAX : 512))) {
+        if (cwd_str != page_buf) {
+            memmove(page_buf, cwd_str, dir_len);
+            cwd_str = page_buf;
+        }
+        end_ptr = cwd_str + dir_len;
+        if (dir_len > 0 && *(end_ptr - 1) != '/') { *end_ptr = '/'; end_ptr++; dir_len++; }
+        memcpy(end_ptr, rel_name, name_len + 1);
+        if (out_len) *out_len = dir_len + name_len;
+        *out_path = cwd_str;
+        return page_buf;
     }
-    mz_hidden_path_count_int = 0;
-    atomic_set(&mz_hidden_path_count, 0);
-    mutex_unlock(&mz_hidden_mutex);
+
+    if (page_buf != fast_buf) __putname(page_buf);
+    return NULL;
+}
+
+/**
+ * mountzero_get_rule_by_inode - Look up the registered rule for an inode
+ * @inode: The inode to query
+ *
+ * NOTE: The caller MUST hold rcu_read_lock() before calling this function
+ * and keep it held as long as the returned rule is being used.
+ */
+static inline struct mountzero_rule *mountzero_get_rule_by_inode(struct inode *inode) {
+    struct mz_inode_node *inode_node;
+    hash_for_each_possible_rcu(mountzero_inodes_ht, inode_node, node, inode->i_ino) {
+        if (inode_node->ino == inode->i_ino && inode_node->dev == inode->i_sb->s_dev) {
+            switch (inode_node->type) {
+                case MZ_INO_TYPE_REAL:
+                    return container_of(inode_node, struct mountzero_rule, real_node);
+                case MZ_INO_TYPE_VIRTUAL:
+                    return container_of(inode_node, struct mountzero_rule, virt_node);
+            }
+        }
+    }
+    return NULL;
+}
+
+/**
+ * mountzero_get_rule_by_path - Look up the rule for a virtual path
+ * @pathname: The requested virtual path
+ * @len: The length of the requested path
+ *
+ * Performs a fast hash lookup to find redirection rules.
+ * Returns a pointer to the rule, or NULL if no rule matches.
+ *
+ * NOTE: The caller MUST hold rcu_read_lock() before calling this function
+ * and keep it held as long as the returned rule is being used.
+ */
+static inline struct mountzero_rule *mountzero_get_rule_by_path(const char *pathname, size_t len) {
+    struct mountzero_rule *rule;
+    u32 hash = full_name_hash(NULL, pathname, len);
+    hash_for_each_possible_rcu(mountzero_rules_ht, rule, vpath_node, hash) {
+        if (rule->v_hash == hash && rule->virt_node.len == len &&
+             memcmp(pathname, rule->virtual_path, len) == 0) {
+            return rule;
+        }
+    }
+    return NULL;
+}
+
+/*** VFS Hooks & Injection Logic ***/
+
+/**
+ * mountzero_handle_dpath - Intercept d_path calls to hide real locations
+ * @path: The path struct being resolved
+ * @buf: The buffer to write the result into
+ * @buflen: Length of the buffer
+ *
+ * Replaces the real physical path of an injected file with its intended 
+ * virtual path to prevent information leaks in Userspace.
+ * 
+ * Returns a pointer within the buffer where the virtual path begins.
+ */
+char *mountzero_handle_dpath(const struct path *path, char *buf, int buflen) 
+{
+    struct mountzero_rule *rule;
+    char *res; int len;
+
+    if (unlikely(IS_ERR_OR_NULL(path) || !path->dentry || !path->dentry->d_inode)) return NULL;
+    if (__mountzero_should_skip()) return NULL;
+
+    rcu_read_lock();
+    rule = mountzero_get_rule_by_inode(path->dentry->d_inode);
+
+    if (likely(rule)) {
+        len = rule->virt_node.len;
+        if (likely(buflen >= len + 1)) {
+            res = buf + buflen - len - 1;
+            memcpy(res, rule->virtual_path, len + 1);
+            mz_debug("d_path spoofed %s to %s\n", rule->real_path, rule->virtual_path);
+            rcu_read_unlock();
+            return res;
+        }
+    }
+
+    rcu_read_unlock();
+    return NULL;
+}
+
+/**
+ * mountzero_handle_permission - Enforce permissions for injected structure
+ * @inode: The inode being accessed
+ * @mask: The requested permission mask
+ *
+ * Return: > 0 to bypass native checks (allow read/exec), 
+ *         < 0 to explicitly deny (block writes), 
+ *           0 to fallback to standard VFS permissions.
+ */
+int mountzero_handle_permission(struct inode *inode, int mask)
+{
+    bool is_injected = false, is_dir = false;
+
+    if (__mountzero_should_skip() || IS_ERR_OR_NULL(inode)) return 0;
+
+    rcu_read_lock();
+    is_injected = __mountzero_is_injected_file_rcu(inode);
+    if (!is_injected && likely(S_ISDIR(inode->i_mode))) {
+        is_dir = __mountzero_is_traversal_allowed_rcu(inode);
+    }
+    rcu_read_unlock();
+
+    if (is_dir && !is_injected) {
+        if (mask & (MAY_READ | MAY_WRITE | MAY_APPEND)) return 0;
+        if (mask & MAY_EXEC) return 1;
+    }
+
+    if (is_injected) {
+        if (mask & (MAY_WRITE | MAY_APPEND)) return 0;
+        return 1; 
+    }
 
     return 0;
 }
-EXPORT_SYMBOL(mountzero_clear_hidden_paths);
 
-/* ============================================================
- * Auto Module Scanner - Proper VFS Path Mapping
- * ============================================================ */
-
-struct mz_scan_callback_data {
-    struct dir_context ctx;  /* MUST be first for container_of */
-    int rules_added;
-    int rules_failed;
-    const char *module_id;
-    const char *module_base;
-    const char *partition;  /* "system", "vendor", etc. or NULL for custom */
-};
-
-static int mz_scan_partition_callback(struct dir_context *ctx, const char *name,
-                                       int namlen, loff_t offset, u64 ino, unsigned int d_type)
+/**
+ * mountzero_handle_getname - Redirect paths during filename struct creation
+ * @name: The original filename struct requested by userspace
+ *
+ * This is the primary entry point for path redirection. If the requested 
+ * path matches a rule, it alters the filename struct to point to the real 
+ * physical location on disk.
+ * 
+ * Returns the modified filename struct, or the original if no match.
+ */
+struct filename *mountzero_handle_getname(struct filename *name)
 {
-    struct mz_scan_callback_data *cb = container_of(ctx, struct mz_scan_callback_data, ctx);
-    char real_path[512];
-    char virt_path[512];
+    struct mountzero_rule *rule;
+    const char *check_name, *s, *last_slash, *page_buf = NULL;
+    size_t name_len, b_len, r_len;
+    bool basename_match = false;
+    u32 b_hash;
+    char fast_buf[512];
 
-    /* Skip . and .. */
-    if (name[0] == '.' && (namlen == 1 || (namlen == 2 && name[1] == '.')))
-        return 0;
+    if (unlikely(__mountzero_should_skip()))
+        return name;
 
-    /* Build paths based on partition type */
-    if (cb->partition) {
-        /* Standard module: /data/adb/modules/<id>/system/bin/foo → /system/bin/foo */
-        snprintf(real_path, sizeof(real_path), "%s/%s/%.*s", cb->module_base, cb->partition, namlen, name);
-        snprintf(virt_path, sizeof(virt_path), "/%s/%.*s", cb->partition, namlen, name);
-    } else {
-        /* Custom module (DroidSpaces): /data/local/Droidspaces/etc/foo → /system/etc/foo */
-        snprintf(real_path, sizeof(real_path), "%s/%.*s", cb->module_base, namlen, name);
-        snprintf(virt_path, sizeof(virt_path), "/system/%.*s", namlen, name);
+    if (unlikely(IS_ERR_OR_NULL(name) || !name->name))
+        return name;
+
+    s = name->name;
+    name_len = strlen(s);
+    if (unlikely(name_len == 1 && s[0] == '/'))
+        return name;
+
+    last_slash = strrchr(s, '/');
+    check_name = (last_slash && *(last_slash + 1) != '\0') ? last_slash + 1 : s;
+    b_len = name_len - (check_name - s);
+    b_hash = full_name_hash(NULL, check_name, b_len);
+
+    rcu_read_lock();
+    if (unlikely(s[0] == '/' && !list_empty(&mountzero_private_dirs_list) && current_uid().val >= AID_APP_START)) {
+        struct mountzero_dir_node *priv_dir;
+        list_for_each_entry_rcu(priv_dir, &mountzero_private_dirs_list, private_list) {
+            size_t len = priv_dir->dir.len;
+            if (name_len >= len && s[1] == priv_dir->dir_path[1] && memcmp(s, priv_dir->dir_path, len) == 0) {
+                if (unlikely(s[len] == '\0' || s[len] == '/')) {
+                    goto out_unlock;
+                }
+            }
+        }
     }
 
-    if (d_type == DT_DIR) {
-        /* Recursively scan subdirectory */
-        struct file *sub_filp;
-        int ret;
+    hash_for_each_possible_rcu(mountzero_basenames_ht, rule, basename_node, b_hash) {
+        if (rule->b_len == b_len && memcmp(rule->basename, check_name, b_len) == 0) {
+            basename_match = true;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    if (unlikely(!basename_match)) return name;
 
-        sub_filp = filp_open(real_path, O_RDONLY | O_DIRECTORY, 0);
-        if (IS_ERR(sub_filp))
-            return 0;
+    check_name = s;
+    r_len = name_len;
+    if (unlikely(s[0] != '/')) {
+        page_buf = mountzero_build_path_from_pwd(s, name_len, &r_len, &check_name, fast_buf);
+        if (!page_buf) return name;
+    }
 
-        /* Setup sub-callback with proper initialization */
-        struct mz_scan_callback_data sub_cb = {
-            .ctx.actor = mz_scan_partition_callback,
-            .ctx.pos = 0,
-            .module_id = cb->module_id,
-            .module_base = cb->module_base,
-            .partition = cb->partition,
-            .rules_added = 0,
-            .rules_failed = 0
-        };
+    rcu_read_lock();
+    rule = mountzero_get_rule_by_path(check_name, r_len);
+    if (likely(rule)) {
+        mz_debug("Redirected: %s -> %s\n", check_name, rule->real_path);
+        memcpy((char *)name->name, rule->real_path, rule->real_node.len);
+        ((char *)name->name)[rule->real_node.len] = '\0';
+    }
+    rcu_read_unlock();
+    if (page_buf && page_buf != fast_buf) __putname(page_buf);
+    return name;
 
-        ret = iterate_dir(sub_filp, &sub_cb.ctx);
-        filp_close(sub_filp, NULL);
+out_unlock:
+    rcu_read_unlock();
+    putname(name);
+    return ERR_PTR(-ENOENT);
+}
 
-        cb->rules_added += sub_cb.rules_added;
-        cb->rules_failed += sub_cb.rules_failed;
-    } else if (d_type == DT_REG || d_type == DT_LNK) {
-        /* Add redirect rule */
-        if (mountzero_add_redirect(virt_path, real_path, 0) == 0) {
-            cb->rules_added++;
+/**
+ * mountzero_handle_iterate_dir - Replaces the native VFS iterate function
+ * @file: The directory file being iterated
+ * @ctx: The VFS directory context
+ *
+ * This function wraps around the native iterate mechanisms to seamlessly
+ * inject virtual directory entries into the directory listing.
+ */
+int mountzero_handle_iterate_dir(struct file *file, struct dir_context *ctx)
+{
+    struct mountzero_dir_node *curr_dir;
+    struct mz_child_array *array = NULL;
+    loff_t old_pos = ctx->pos;
+    loff_t mountzero_magic_pos = 0x7000000000000000ULL;
+    unsigned long v_index;
+    int res = 0;
+    u32 i;
+
+    if (!static_branch_unlikely(&mountzero_active_dirs) || __mountzero_should_skip()) {
+        if (file->f_op->iterate_shared)
+            return file->f_op->iterate_shared(file, ctx);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+        else if (file->f_op->iterate)
+            return file->f_op->iterate(file, ctx);
+#endif
+        return -ENOTDIR;
+    }
+
+#ifdef CONFIG_COMPAT
+    if (in_compat_syscall()) mountzero_magic_pos = 0x7E000000;
+#endif
+    if (ctx->pos < mountzero_magic_pos) {
+        if (file->f_op->iterate_shared)
+            res = file->f_op->iterate_shared(file, ctx);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+        else if (file->f_op->iterate)
+            return file->f_op->iterate(file, ctx);
+#endif
+        else
+            return -ENOTDIR;
+    }
+
+    if (res >= 0 && (ctx->pos == old_pos || ctx->pos >= mountzero_magic_pos)) {
+        struct mz_inode_node *inode_node;
+        struct inode *dir_inode = file_inode(file);
+        if (!dir_inode) return res;
+
+        rcu_read_lock();
+        hash_for_each_possible_rcu(mountzero_inodes_ht, inode_node, node, dir_inode->i_ino) {
+            if (likely(inode_node->ino == dir_inode->i_ino && inode_node->dev == dir_inode->i_sb->s_dev)) {
+                if (likely(inode_node->type & MZ_INO_TYPE_DIR)) {
+                    curr_dir = container_of(inode_node, struct mountzero_dir_node, dir);
+                    array = rcu_dereference(curr_dir->child_array);
+                    if (likely(array && atomic_inc_not_zero(&array->refcnt))) break;
+                    array = NULL;
+                }
+                break; 
+            }
+        }
+        rcu_read_unlock();
+        if (!array) return res;
+
+        if (ctx->pos >= mountzero_magic_pos && ctx->pos < mountzero_magic_pos + 100000) {
+            v_index = (unsigned long)(ctx->pos - mountzero_magic_pos);
         } else {
-            cb->rules_failed++;
-            pr_warn("MountZero: Failed to add rule: %s -> %s\n", virt_path, real_path);
+            v_index = 0;
+            ctx->pos = mountzero_magic_pos;
         }
+
+        for (i = v_index; i < array->num_children; i++) {
+            struct mountzero_child_name *child = &array->entries[i];
+            if (!dir_emit(ctx, child->name, child->name_len, child->fake_ino, child->d_type))
+                break;
+            ctx->pos = mountzero_magic_pos + i + 1;
+        }
+
+        if (atomic_dec_and_test(&array->refcnt)) kfree_rcu(array, rcu);
     }
 
-    return 0;
+    return res;
 }
 
-/* Scan a specific partition directory within a module */
-static int mz_scan_module_partition(const char *module_id, const char *module_base, const char *partition)
+/*** Metadata Spoofing ***/
+
+/**
+ * mountzero_handle_getattr - Wrapper for vfs_getattr intercept
+ * @ret: The return code from the native vfs_getattr execution
+ * @path: The path being evaluated
+ * @stat: The stat struct populated by the kernel
+ *
+ * Applies the stat spoofing logic only if the original lookup succeeded.
+ * Returns the original return code.
+ */
+int mountzero_handle_getattr(int ret, const struct path *path, struct kstat *stat)
 {
-    struct file *filp;
-    char dir_path[512];
-    int ret;
+    struct mz_inode_node *inode_node;
+    struct mountzero_rule *rule;
+    struct inode *inode;
 
-    snprintf(dir_path, sizeof(dir_path), "%s/%s", module_base, partition);
+    if (unlikely(ret != 0 || __mountzero_should_skip())) return ret;
+    if (unlikely(IS_ERR_OR_NULL(path) || IS_ERR_OR_NULL(stat) || IS_ERR_OR_NULL(path->dentry))) return ret;
 
-    filp = filp_open(dir_path, O_RDONLY | O_DIRECTORY, 0);
-    if (IS_ERR(filp))
-        return PTR_ERR(filp);
+    inode = d_backing_inode(path->dentry);
+    if (unlikely(IS_ERR_OR_NULL(inode) || IS_ERR_OR_NULL(inode->i_sb))) return ret;
 
-    /* Setup callback with proper initialization */
-    struct mz_scan_callback_data cb = {
-        .ctx.actor = mz_scan_partition_callback,
-        .ctx.pos = 0,
-        .module_id = module_id,
-        .module_base = module_base,
-        .partition = partition,
-        .rules_added = 0,
-        .rules_failed = 0
-    };
-
-    ret = iterate_dir(filp, &cb.ctx);
-    filp_close(filp, NULL);
-
-    if (cb.rules_added > 0 || cb.rules_failed > 0)
-        pr_info("MountZero: Module %s/%s -> /%s (%d rules, %d failed)\n",
-                module_id, partition, partition, cb.rules_added, cb.rules_failed);
+    rcu_read_lock();
+    hash_for_each_possible_rcu(mountzero_inodes_ht, inode_node, node, inode->i_ino) {
+        if (inode_node->ino == inode->i_ino && inode_node->dev == inode->i_sb->s_dev) {
+            if (inode_node->type & MZ_INO_TYPE_REAL) {
+                rule = container_of(inode_node, struct mountzero_rule, real_node);
+                stat->ino = READ_ONCE(rule->virt_node.ino);
+                if (rule->virt_node.dev != 0)
+                    stat->dev = READ_ONCE(rule->virt_node.dev);
+            }
+            break;
+        }
+    }
+    rcu_read_unlock();
 
     return ret;
 }
 
-/* Scan a custom module (like DroidSpaces) */
-static int mz_scan_custom_module(const char *module_id, const char *module_base)
+/**
+ * mountzero_spoof_statfs - Forge filesystem type data
+ * @path: The path being evaluated
+ * @buf: The statfs struct to modify
+ *
+ * Injects the correct Magic Number (e.g., ext4, erofs) to match the 
+ * virtual partition, preventing detection via filesystem type checks.
+ */
+void mountzero_spoof_statfs(const struct path *path, struct kstatfs *buf)
 {
-    struct file *filp;
-    int ret;
+    struct mz_inode_node *inode_node;
+    struct mountzero_rule *rule = NULL;
+    struct inode *inode;
 
-    filp = filp_open(module_base, O_RDONLY | O_DIRECTORY, 0);
-    if (IS_ERR(filp))
-        return PTR_ERR(filp);
+    if (unlikely(__mountzero_should_skip() || IS_ERR_OR_NULL(path) || IS_ERR_OR_NULL(buf) || IS_ERR_OR_NULL(path->dentry))) return;
 
-    /* Setup callback with proper initialization */
-    struct mz_scan_callback_data cb = {
-        .ctx.actor = mz_scan_partition_callback,
-        .ctx.pos = 0,
-        .module_id = module_id,
-        .module_base = module_base,
-        .partition = NULL,  /* Custom structure - map to /system/ */
-        .rules_added = 0,
-        .rules_failed = 0
-    };
+    inode = d_backing_inode(path->dentry);
+    if (unlikely(IS_ERR_OR_NULL(inode) || IS_ERR_OR_NULL(inode->i_sb))) return;
 
-    ret = iterate_dir(filp, &cb.ctx);
-    filp_close(filp, NULL);
+    rcu_read_lock();
+    hash_for_each_possible_rcu(mountzero_inodes_ht, inode_node, node, inode->i_ino) {
+        if (inode_node->ino == inode->i_ino && inode_node->dev == inode->i_sb->s_dev) {
+            switch (inode_node->type) {
+                case MZ_INO_TYPE_REAL:
+                    rule = container_of(inode_node, struct mountzero_rule, real_node);
+                    break;
+                case MZ_INO_TYPE_VIRTUAL:
+                    rule = container_of(inode_node, struct mountzero_rule, virt_node);
+                    break;
+                default:
+                    goto unlock; 
+            }
+            if (rule && rule->v_fs_type != 0) 
+                buf->f_type = READ_ONCE(rule->v_fs_type);
+            break;
+        }
+    }
 
-    if (cb.rules_added > 0 || cb.rules_failed > 0)
-        pr_info("MountZero: Custom module %s -> /system/ (%d rules, %d failed)\n",
-                module_id, cb.rules_added, cb.rules_failed);
-
-    return ret;
+unlock:
+    rcu_read_unlock();
 }
 
-/* Check if module is enabled */
-static bool mz_is_module_enabled(const char *module_id)
+/**
+ * mountzero_spoof_mmap_metadata - Forge VMA metadata for /proc/self/maps
+ * @inode: The underlying inode of the mapped memory
+ * @dev: Pointer to the device ID variable to overwrite
+ * @ino: Pointer to the inode number variable to overwrite
+ *
+ * Ensures that shared libraries or binaries executed via MountZero show 
+ * the correct virtual device and inode in process memory maps.
+ * 
+ * Returns true if the metadata was spoofed.
+ */
+bool mountzero_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino)
 {
-    struct path path;
-    char disable_path[512];
-    int ret;
+    struct mz_inode_node *inode_node;
+    struct mountzero_rule *rule;
 
-    /* Check for disable file */
-    snprintf(disable_path, sizeof(disable_path), "/data/adb/modules/%s/disable", module_id);
-    ret = kern_path(disable_path, 0, &path);
-    if (ret == 0) {
-        path_put(&path);
+    if (unlikely(__mountzero_should_skip() || IS_ERR_OR_NULL(inode) ||
+                 IS_ERR_OR_NULL(inode->i_sb) || IS_ERR_OR_NULL(dev) || IS_ERR_OR_NULL(ino))) 
         return false;
-    }
 
-    /* Check for remove file */
-    snprintf(disable_path, sizeof(disable_path), "/data/adb/modules/%s/remove", module_id);
-    ret = kern_path(disable_path, 0, &path);
-    if (ret == 0) {
-        path_put(&path);
-        return false;
-    }
-
-    /* Check for skip_mount file */
-    snprintf(disable_path, sizeof(disable_path), "/data/adb/modules/%s/skip_mount", module_id);
-    ret = kern_path(disable_path, 0, &path);
-    if (ret == 0) {
-        path_put(&path);
-        return false;
-    }
-
-    return true;
-}
-
-/* Standard partitions to scan */
-static const char * const standard_partitions[] = {
-    "system", "vendor", "product", "system_ext", "odm", "odm_dlkm", "vendor_dlkm"
-};
-
-/* Callback for iterating through module directories in /data/adb/modules/ */
-static int mz_scan_adb_modules_callback(struct dir_context *ctx, const char *name,
-                                         int namlen, loff_t offset, u64 ino, unsigned int d_type)
-{
-    char module_id[256];
-    char module_base[512];
-    int i;
-
-    if (name[0] == '.' && (namlen == 1 || (namlen == 2 && name[1] == '.')))
-        return 0;
-
-    if (d_type != DT_DIR && d_type != DT_UNKNOWN)
-        return 0;
-
-    snprintf(module_id, sizeof(module_id), "%.*s", namlen, name);
-    snprintf(module_base, sizeof(module_base), "/data/adb/modules/%s", module_id);
-
-    if (!mz_is_module_enabled(module_id)) {
-        pr_info("MountZero: Skipping disabled module: %s\n", module_id);
-        return 0;
-    }
-
-    pr_info("MountZero: Scanning module: %s\n", module_id);
-
-    /* Scan standard partitions */
-    for (i = 0; i < ARRAY_SIZE(standard_partitions); i++) {
-        mz_scan_module_partition(module_id, module_base, standard_partitions[i]);
-    }
-
-    return 0;
-}
-
-/* Callback for iterating through custom modules in /data/local/ */
-static int mz_scan_local_modules_callback(struct dir_context *ctx, const char *name,
-                                           int namlen, loff_t offset, u64 ino, unsigned int d_type)
-{
-    char module_id[256];
-    char module_base[512];
-
-    if (name[0] == '.' && (namlen == 1 || (namlen == 2 && name[1] == '.')))
-        return 0;
-
-    if (d_type != DT_DIR && d_type != DT_UNKNOWN)
-        return 0;
-
-    snprintf(module_id, sizeof(module_id), "%.*s", namlen, name);
-    snprintf(module_base, sizeof(module_base), "/data/local/%s", module_id);
-
-    pr_info("MountZero: Scanning custom module: %s\n", module_id);
-
-    /* Scan as custom structure (maps to /system/) */
-    mz_scan_custom_module(module_id, module_base);
-
-    return 0;
-}
-
-static int wait_for_data_mount(void)
-{
-    struct path path;
-    int retries = 30;
-
-    while (retries--) {
-        if (kern_path("/data/adb/modules", LOOKUP_FOLLOW, &path) == 0) {
-            path_put(&path);
-            pr_info("MountZero: /data mounted, ready for auto-scan\n");
-            return 0;
+    rcu_read_lock();
+    hash_for_each_possible_rcu(mountzero_inodes_ht, inode_node, node, inode->i_ino) {
+        if (inode_node->ino == inode->i_ino && inode_node->dev == inode->i_sb->s_dev) {
+            if (inode_node->type & MZ_INO_TYPE_REAL) {
+                rule = container_of(inode_node, struct mountzero_rule, real_node);
+                *dev = READ_ONCE(rule->virt_node.dev);
+                *ino = READ_ONCE(rule->virt_node.ino);
+                rcu_read_unlock();
+                return true;
+            }
+            break;
         }
-        msleep(1000);
     }
-    return -ENODEV;
+    rcu_read_unlock();
+    return false;
 }
 
-/* Scan a single module (for hot-plug) */
-int mountzero_scan_single_module(const char *module_id, const char *module_path, bool is_custom)
+/*** Module Management ***/
+
+/**
+ * __mountzero_get_or_create_dir - Factory function to retrieve or create a directory node
+ * @ino: Inode number of the directory
+ * @dev: Device ID of the directory
+ *
+ * Checks if a directory node already exists for the given inode. If not, allocates
+ * a new node from mz_dir_cachep, initializes its lists, and adds it to the global
+ * hash table.
+ *
+ * Return a pointer to the mountzero_dir_node on success, NULL on failure (ENOMEM).
+ */
+static inline struct mountzero_dir_node* __mountzero_get_or_create_dir(unsigned long ino, dev_t dev)
 {
-    int i;
-    int total_rules = 0;
+    struct mz_inode_node *inode_node;
+    struct mountzero_dir_node *dir_node;
 
-    pr_info("MountZero: Hot-plug scanning module: %s\n", module_id);
+    hash_for_each_possible(mountzero_inodes_ht, inode_node, node, ino) {
+        if (inode_node->ino == ino && inode_node->dev == dev) {
+            if (likely(inode_node->type & MZ_INO_TYPE_DIR)) {
+                return container_of(inode_node, struct mountzero_dir_node, dir);
+            }
+        }
+    }
 
-    if (is_custom) {
-        total_rules += mz_scan_custom_module(module_id, module_path);
+    dir_node = kmem_cache_alloc(mz_dir_cachep, GFP_KERNEL);
+    if (unlikely(!dir_node)) return NULL;
+
+    dir_node->dir.ino = ino;
+    dir_node->dir.dev = dev;
+    dir_node->dir.len = 0;
+    dir_node->dir.type = MZ_INO_TYPE_DIR;
+    dir_node->dir_path = NULL;
+    dir_node->is_private = false;
+    INIT_LIST_HEAD(&dir_node->private_list);
+    RCU_INIT_POINTER(dir_node->child_array, NULL);
+    hash_add_rcu(mountzero_inodes_ht, &dir_node->dir.node, ino);
+    atomic_inc(&mz_active_dirs);
+    if (atomic_read(&mz_active_dirs) == 1) static_branch_enable(&mountzero_active_dirs);
+
+    return dir_node;
+}
+
+/* __mountzero_collect_parents - Walks the dentry tree to register directory hierarchy
+ * @rule: The rule containing the absolute real_path string
+ * @d: A valid referenced dentry resolved from kern_path
+ *
+ * This function recursively climbs the dentry tree starting from the provided 
+ * dentry. It registers every parent inode encountered and handles the extraction 
+ * of private directory paths automatically when traversal permissions are restricted.
+ *
+ * This function relies on the caller to provide a valid reference (dget).
+ */
+static void __mountzero_collect_parents(struct mountzero_rule *rule, struct dentry *d)
+{
+    struct dentry *parent;
+    char *r_tmp = rule->real_path, *slash, *slashes[32];
+    int p_count = 0;
+
+    while (d && !IS_ROOT(d) && p_count < 32) {
+        struct inode *inode = d_backing_inode(d);
+        if (likely(inode && S_ISDIR(inode->i_mode))) {
+            struct mountzero_dir_node *dir_node = __mountzero_get_or_create_dir(inode->i_ino, inode->i_sb->s_dev);
+            if (likely(dir_node)) {
+                rule->parent_dir = dir_node;
+                if (unlikely(!(inode->i_mode & S_IXOTH) && !dir_node->dir_path)) {
+                    dir_node->is_private = true;
+                    mz_debug("Registered private dir: %s (ino: %lu)\n", r_tmp, inode->i_ino);
+                    dir_node->dir.len = strlen(r_tmp);
+                    dir_node->dir_path = kmemdup_nul(r_tmp, dir_node->dir.len, GFP_KERNEL);
+                    if (likely(dir_node->dir_path)) {
+                        list_add_tail_rcu(&dir_node->private_list, &mountzero_private_dirs_list);
+                    }
+                }
+            }
+        }
+
+        slash = strrchr(r_tmp, '/');
+        if (!slash || slash == r_tmp) break;
+        *slash = '\0';
+        slashes[p_count++] = slash;
+
+        parent = dget_parent(d);
+        dput(d);
+        d = parent;
+    }
+
+    if (d) dput(d);
+    while (p_count > 0) *slashes[--p_count] = '/';
+}
+
+/**
+ * __mountzero_inject_child_locked - Atomically inserts a virtual child into a parent
+ * @dir_node: The parent directory node to inject into
+ * @rule: The rule associated with the child being injected (used for metadata inheritance)
+ * @name: Filename of the child
+ * @name_len: Length of the name string
+ * @name_hash: Precalculated hash of the name string
+ * @type: File type (DT_DIR, DT_REG, etc.)
+ * @child_fake_ino: The synthetic inode number for the virtual file
+ *
+ * This function performs an hash check to see if the child already exists 
+ * to prevent duplicates, then appends it to the directory's child array.
+ *
+ * NOTE: Caller MUST hold the mutex lock to prevent concurrent writers, 
+ * but RCU readers can continue without blocking.
+ */
+static void __mountzero_inject_child_locked(struct mountzero_dir_node *dir_node, struct mountzero_rule *rule,
+                                          const char *name, size_t name_len, u32 name_hash,
+                                          unsigned char type, unsigned long child_fake_ino)
+{
+    struct mz_child_array *old_array, *new_array;
+    u32 i, old_num = 0;
+
+    if (unlikely(!dir_node)) return;
+    rule->parent_dir = dir_node;
+
+    old_array = rcu_dereference_protected(dir_node->child_array, lockdep_is_held(&mountzero_write_mutex));
+    if (old_array) {
+        old_num = old_array->num_children;
+        for (i = 0; i < old_num; i++) {
+            if (old_array->entries[i].name_len == name_len &&
+                !memcmp(old_array->entries[i].name, name, name_len)) {
+                return;
+            }
+        }
+    }
+
+    new_array = kmalloc(sizeof(struct mz_child_array) + (old_num + 1) * sizeof(struct mountzero_child_name), GFP_KERNEL);
+    if (unlikely(!new_array)) return;
+
+    atomic_set(&new_array->refcnt, 1);
+    new_array->num_children = old_num + 1;
+
+    if (old_array) memcpy(new_array->entries, old_array->entries, 
+                          old_num * sizeof(struct mountzero_child_name));
+
+    memcpy(new_array->entries[old_num].name, name, name_len + 1);
+    new_array->entries[old_num].name_len = (u16)name_len;
+    new_array->entries[old_num].d_type = type;
+    new_array->entries[old_num].fake_ino = child_fake_ino;
+    rcu_assign_pointer(dir_node->child_array, new_array);
+
+    if (old_array && atomic_dec_and_test(&old_array->refcnt)) {
+        kfree_rcu(old_array, rcu);
+    }
+}
+
+static void __mountzero_delete_child_locked(struct mountzero_dir_node *dir_node, unsigned long fake_ino, 
+                                          struct hlist_head *d_victims)
+{
+    struct mz_child_array *old_array, *new_array;
+    int found_idx = -1;
+    u32 i, num, dst = 0;
+
+    old_array = rcu_dereference_protected(dir_node->child_array, lockdep_is_held(&mountzero_write_mutex));
+    if (!old_array) return;
+
+    num = old_array->num_children;
+    for (i = 0; i < num; i++) {
+        if (old_array->entries[i].fake_ino == fake_ino) {
+            found_idx = i;
+            break;
+        }
+    }
+    if (found_idx == -1) return;
+
+    if (num == 1) {
+        rcu_assign_pointer(dir_node->child_array, NULL);
+        if (atomic_dec_and_test(&old_array->refcnt)) kfree_rcu(old_array, rcu);
+        hash_del_rcu(&dir_node->dir.node);
+        if (unlikely(dir_node->is_private)) list_del_rcu(&dir_node->private_list);
+        atomic_dec(&mz_active_dirs);
+        if (atomic_read(&mz_active_dirs) == 0) static_branch_disable(&mountzero_active_dirs);
+        hlist_add_head(&dir_node->dir.node, d_victims);
     } else {
-        for (i = 0; i < ARRAY_SIZE(standard_partitions); i++) {
-            total_rules += mz_scan_module_partition(module_id, module_path, standard_partitions[i]);
+        new_array = kmalloc(sizeof(struct mz_child_array) + (num - 1) * sizeof(struct mountzero_child_name), GFP_KERNEL);
+        if (unlikely(!new_array)) return;
+
+        atomic_set(&new_array->refcnt, 1);
+        new_array->num_children = num - 1;
+        for (i = 0; i < num; i++) {
+            if (i == found_idx) continue;
+            memcpy(&new_array->entries[dst++], &old_array->entries[i], sizeof(struct mountzero_child_name));
         }
+        rcu_assign_pointer(dir_node->child_array, new_array);
+        if (atomic_dec_and_test(&old_array->refcnt))
+            kfree_rcu(old_array, rcu);
     }
-
-    pr_info("MountZero: Module %s scan complete: %d rules added\n", module_id, total_rules);
-    return total_rules;
-}
-EXPORT_SYMBOL(mountzero_scan_single_module);
-
-/* Hot-plug auto-detection state */
-static bool mz_hotplug_enabled = true;
-static struct task_struct *mz_hotplug_thread;
-static DECLARE_WAIT_QUEUE_HEAD(mz_hotplug_wait);
-
-/* Hot-plug kernel thread - watches for new modules */
-static int mz_hotplug_thread_fn(void *data)
-{
-    while (!kthread_should_stop()) {
-        wait_event_interruptible_timeout(mz_hotplug_wait,
-                                 kthread_should_stop() || !mz_hotplug_enabled,
-                                 msecs_to_jiffies(5000));
-
-        if (mz_hotplug_enabled && !kthread_should_stop()) {
-            /* Module polling logic handled by userspace service.sh */
-        }
-    }
-    return 0;
 }
 
-/* Enable hot-plug auto-detection */
-void mountzero_enable_hotplug(void)
+/**
+ * mountzero_generate_virtual_topology - Autogenerates intermediate directory rules
+ * @rule: The main rule being added
+ *
+ * Walks the path backwards using in-place mutation to find the closest
+ * native parent, inherits its metadata (s_dev, s_magic), and auto-injects
+ * intermediate virtual directory rules to satisfy VFS lookups.
+ *
+ * Returns 0 on success, or negative error code (e.g., -ENOMEM) on failure.
+ */
+static int mountzero_generate_virtual_topology(struct mountzero_rule *rule)
 {
-    mz_hotplug_enabled = true;
-    wake_up(&mz_hotplug_wait);
-    pr_info("MountZero: Hot-plug auto-detection enabled\n");
-}
-EXPORT_SYMBOL(mountzero_enable_hotplug);
+    struct mountzero_rule *ex, *irule = NULL, *t_rule, *pending_rules[32];
+    struct path p_path, r_path_struct;
+    char *v_tmp = rule->virtual_path, *r_tmp = rule->real_path;
+    char *slash_v, *slash_r, *b_slash, *slashes_v[32], *slashes_r[32];
+    int cur_v_len = rule->virt_node.len, cur_r_len = rule->real_node.len;
+    int p_count = 0, err = 0, current_flags = rule->flags;
+    unsigned long inherited_dev = 0, inherited_fs_type = 0;
+    unsigned long current_parent_ino; dev_t current_parent_dev;
+    const char *b_name_inter, *child_name;
+    bool inter_exists;
+    size_t child_name_len;
+    u32 child_name_hash, h_inter;
 
-/* Disable hot-plug auto-detection */
-void mountzero_disable_hotplug(void)
-{
-    mz_hotplug_enabled = false;
-    pr_info("MountZero: Hot-plug auto-detection disabled\n");
-}
-EXPORT_SYMBOL(mountzero_disable_hotplug);
-
-static int __init mountzero_auto_scan_modules(void)
-{
-    struct file *filp;
-    int ret;
-
-    /* Check bootloop guard */
-    if (atomic_read(&mz_bootloop_count) >= mz_bootloop_threshold) {
-        mz_guard_tripped = true;
-        pr_warn("MountZero: Bootloop guard tripped (count=%d), skipping auto-scan\n",
-                atomic_read(&mz_bootloop_count));
-        return 0;
-    }
-
-    ret = wait_for_data_mount();
-    if (ret) {
-        pr_warn("MountZero: /data not available, skipping auto-scan\n");
-        return 0;
-    }
-
-    /* Scan /data/adb/modules/ - Standard KernelSU modules */
-    pr_info("MountZero: Starting auto-scan of /data/adb/modules...\n");
-
-    filp = filp_open("/data/adb/modules", O_RDONLY | O_DIRECTORY, 0);
-    if (!IS_ERR(filp)) {
-        struct dir_context ctx = {
-            .actor = mz_scan_adb_modules_callback,
-            .pos = 0
-        };
-
-        ret = iterate_dir(filp, &ctx);
-        filp_close(filp, NULL);
-
-        if (ret == 0)
-            pr_info("MountZero: /data/adb/modules scan complete\n");
-        else
-            pr_err("MountZero: /data/adb/modules scan failed: %d\n", ret);
-    } else {
-        pr_info("MountZero: /data/adb/modules not found, skipping\n");
-    }
-
-    /* Scan /data/adb/modules_update/ - Newly installed modules */
-    filp = filp_open("/data/adb/modules_update", O_RDONLY | O_DIRECTORY, 0);
-    if (!IS_ERR(filp)) {
-        struct dir_context ctx = {
-            .actor = mz_scan_adb_modules_callback,
-            .pos = 0
-        };
-
-        ret = iterate_dir(filp, &ctx);
-        filp_close(filp, NULL);
-    }
-
-    /* Scan /data/local/ - Custom modules like DroidSpaces */
-    pr_info("MountZero: Starting auto-scan of /data/local...\n");
-
-    filp = filp_open("/data/local", O_RDONLY | O_DIRECTORY, 0);
-    if (!IS_ERR(filp)) {
-        struct dir_context ctx = {
-            .actor = mz_scan_local_modules_callback,
-            .pos = 0
-        };
-
-        ret = iterate_dir(filp, &ctx);
-        filp_close(filp, NULL);
-
-        if (ret == 0)
-            pr_info("MountZero: /data/local scan complete\n");
-        else
-            pr_err("MountZero: /data/local scan failed: %d\n", ret);
-    } else {
-        pr_info("MountZero: /data/local not found, skipping\n");
-    }
-
-    /* Record successful boot for guard */
-    atomic_set(&mz_bootloop_count, 0);
-
-    pr_info("MountZero: Auto-scan complete. Total rules: %d\n",
-            atomic_read(&mz_rule_count));
-    return 0;
-}
-late_initcall_sync(mountzero_auto_scan_modules);
-
-/* ============================================================
- * IOCTL Handler
- * ============================================================ */
-
-static long mountzero_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
-{
-    int ret = 0;
-
-    if (_IOC_TYPE(cmd) != MOUNTZERO_IOC_MAGIC)
-        return -ENOTTY;
-
-    if (cmd != MOUNTZERO_IOC_GET_VERSION) {
-        if (!capable(CAP_SYS_ADMIN))
-            return -EPERM;
-    }
-
-    switch (cmd) {
-    case MOUNTZERO_IOC_GET_VERSION:
-        return 0;
-
-    case MOUNTZERO_IOC_ENABLE:
-        atomic_set(&mountzero_enabled, 1);
-        pr_info("MountZero: VFS engine enabled\n");
-        return 0;
-
-    case MOUNTZERO_IOC_DISABLE:
-        atomic_set(&mountzero_enabled, 0);
-        pr_info("MountZero: VFS engine disabled\n");
-        return 0;
-
-    case MOUNTZERO_IOC_GET_STATUS:
-        return atomic_read(&mountzero_enabled);
-
-    case MOUNTZERO_IOC_ADD_REDIRECT: {
-        struct mz_ioctl_rule rule;
-        if (copy_from_user(&rule, (void __user *)arg, sizeof(rule)))
-            return -EFAULT;
-        rule.virtual_path[sizeof(rule.virtual_path) - 1] = '\0';
-        rule.real_path[sizeof(rule.real_path) - 1] = '\0';
-        return mountzero_add_redirect(rule.virtual_path, rule.real_path, rule.flags);
-    }
-
-    case MOUNTZERO_IOC_DEL_REDIRECT: {
-        char vpath[256];
-        if (copy_from_user(vpath, (void __user *)arg, sizeof(vpath)))
-            return -EFAULT;
-        vpath[sizeof(vpath) - 1] = '\0';
-        return mountzero_del_redirect(vpath);
-    }
-
-    case MOUNTZERO_IOC_INSTALL_MODULE: {
-        struct mz_install_module mod;
-        if (copy_from_user(&mod, (void __user *)arg, sizeof(mod)))
-            return -EFAULT;
-        mod.module_id[sizeof(mod.module_id) - 1] = '\0';
-        mod.module_path[sizeof(mod.module_path) - 1] = '\0';
-        return mountzero_scan_single_module(mod.module_id, mod.module_path, mod.is_custom);
-    }
-
-    case MOUNTZERO_IOC_CLEAR: {
-        struct mz_rule *rule;
-        struct hlist_node *tmp;
-        int bkt;
-        unsigned long irq_flags;
-
-        /*
-         * CRITICAL: Disable MountZero first to prevent new VFS hook lookups.
-         * Then synchronize_rcu() to wait for any in-flight VFS path resolution
-         * to complete before freeing rules. Without this, concurrent
-         * mountzero_resolve_path() can access freed rule memory → panic/reboot.
-         */
-        atomic_set(&mountzero_enabled, 0);
-        synchronize_rcu();
-
-        spin_lock_irqsave(&mz_lock, irq_flags);
-
-        /* Clear redirect rules hash table */
-        hash_for_each_safe(mz_redirect_rules_ht, bkt, tmp, rule, node) {
-            hash_del(&rule->node);
-            /* Also remove from inode hash table to prevent use-after-free */
-            if (!hlist_unhashed(&rule->ino_node))
-                hash_del(&rule->ino_node);
-            kfree(rule->virtual_path);
-            kfree(rule->real_path);
-            kfree(rule);
+    while (p_count < 32) {
+        slash_v = strrchr(v_tmp, '/');
+        slash_r = r_tmp ? strrchr(r_tmp, '/') : NULL; 
+        if (slash_r == r_tmp) slash_r = NULL;
+        if (!slash_v || slash_v == v_tmp) {
+            if (likely(kern_path("/", LOOKUP_FOLLOW, &p_path) == 0)) {
+                current_parent_ino = d_backing_inode(p_path.dentry)->i_ino;
+                current_parent_dev = d_backing_inode(p_path.dentry)->i_sb->s_dev;
+                child_name = v_tmp + 1;
+                child_name_len = strlen(child_name);
+                child_name_hash = full_name_hash(NULL, child_name, child_name_len);
+                t_rule = (p_count == 0) ? rule : pending_rules[p_count - 1];
+                __mountzero_inject_child_locked(__mountzero_get_or_create_dir(current_parent_ino, current_parent_dev),
+                                              t_rule, child_name, child_name_len, child_name_hash,
+                                              (current_flags & MZ_FLAG_IS_DIR) ? DT_DIR : DT_REG, t_rule->v_hash);
+                path_put(&p_path);
+            }
+            break;
         }
 
-        /* Also sweep mz_ino_ht for any orphaned entries */
-        hash_for_each_safe(mz_ino_ht, bkt, tmp, rule, ino_node) {
-            hash_del(&rule->ino_node);
-            kfree(rule->virtual_path);
-            kfree(rule->real_path);
-            kfree(rule);
+        *slash_v = '\0';
+        slashes_v[p_count] = slash_v;
+        cur_v_len = slash_v - v_tmp;
+
+        if (slash_r) {
+            *slash_r = '\0';
+            slashes_r[p_count] = slash_r;
+            cur_r_len = slash_r - r_tmp;
+        } else {
+            slashes_r[p_count] = NULL;
         }
 
-        bitmap_zero(mz_bloom, MZ_BLOOM_BITS);
+        pending_rules[p_count] = NULL; 
+        p_count++;
+        h_inter = full_name_hash(NULL, v_tmp, cur_v_len);
+        inter_exists = false;
 
-        spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-        /* Re-enable MountZero after rules are cleared safely */
-        atomic_set(&mountzero_enabled, 1);
-
-        pr_info("MountZero: All rules cleared safely\n");
-        return 0;
-    }
-
-    case MOUNTZERO_IOC_LIST: {
-        struct mz_ioctl_list list;
-        int count = 0;
-        struct mz_rule *rule;
-        int bkt;
-        int offset = 0;
-
-        memset(&list, 0, sizeof(list));
-
-        spin_lock(&mz_lock);
-
-        hash_for_each(mz_redirect_rules_ht, bkt, rule, node) {
-            int len = snprintf(list.entries + offset, sizeof(list.entries) - offset,
-                             "REDIRECT: %s -> %s\n", rule->virtual_path, rule->real_path);
-            if (len > 0 && offset + len < sizeof(list.entries)) {
-                offset += len;
-                count++;
-            } else {
+        hash_for_each_possible(mountzero_rules_ht, ex, vpath_node, h_inter) {
+            if (ex->virt_node.len == cur_v_len && memcmp(ex->virtual_path, v_tmp, cur_v_len) == 0) {
+                inherited_dev = ex->virt_node.dev;
+                inherited_fs_type = ex->v_fs_type;
+                current_parent_ino = ex->virt_node.ino;
+                current_parent_dev = ex->virt_node.dev;
+                inter_exists = true;
                 break;
             }
         }
 
-        spin_unlock(&mz_lock);
+        if (inter_exists) {
+            child_name = slash_v + 1;
+            child_name_len = strlen(child_name);
+            child_name_hash = full_name_hash(NULL, child_name, child_name_len);
+            t_rule = (p_count == 1) ? rule : pending_rules[p_count - 2];
+            __mountzero_inject_child_locked(__mountzero_get_or_create_dir(current_parent_ino, current_parent_dev),
+                                          t_rule, child_name, child_name_len, child_name_hash,
+                                          (current_flags & MZ_FLAG_IS_DIR) ? DT_DIR : DT_REG, t_rule->v_hash);
+            break;
+        }
 
-        list.count = count;
+        if (likely(kern_path(v_tmp, LOOKUP_FOLLOW, &p_path) == 0)) {
+            inherited_dev = p_path.dentry->d_sb->s_dev;
+            if (p_path.dentry->d_sb->s_op->statfs) {
+                struct kstatfs st;
+                p_path.dentry->d_sb->s_op->statfs(p_path.dentry, &st);
+                inherited_fs_type = st.f_type;
+            } else {
+                inherited_fs_type = p_path.dentry->d_sb->s_magic;
+            }
+            current_parent_ino = d_backing_inode(p_path.dentry)->i_ino;
+            current_parent_dev = d_backing_inode(p_path.dentry)->i_sb->s_dev;
+            child_name = slash_v + 1;
+            child_name_len = strlen(child_name);
+            child_name_hash = full_name_hash(NULL, child_name, child_name_len);
+            t_rule = (p_count == 1) ? rule : pending_rules[p_count - 2];
+            __mountzero_inject_child_locked(__mountzero_get_or_create_dir(current_parent_ino, current_parent_dev),
+                                          t_rule, child_name, child_name_len, child_name_hash,
+                                          (current_flags & MZ_FLAG_IS_DIR) ? DT_DIR : DT_REG, t_rule->v_hash);
+            path_put(&p_path);
+            break; 
+        } else {
+            pending_rules[p_count - 1] = kmem_cache_alloc(mz_rule_cachep, GFP_KERNEL);
+            if (unlikely(!pending_rules[p_count - 1])) {
+                err = -ENOMEM;
+                break;
+            }
 
-        if (copy_to_user((void __user *)arg, &list, sizeof(list)))
-            return -EFAULT;
+            irule = pending_rules[p_count - 1];
 
-        return 0;
-    }
+            INIT_LIST_HEAD(&irule->list);
+            INIT_HLIST_NODE(&irule->vpath_node);
+            INIT_HLIST_NODE(&irule->basename_node);
 
-    /* SUSFS Bridge IOCTLs */
-#ifdef CONFIG_KSU_SUSFS
-    case MOUNTZERO_IOC_ADD_SUS_PATH: {
-        char path[256];
-        if (copy_from_user(path, (void __user *)arg, sizeof(path)))
-            return -EFAULT;
-        path[sizeof(path) - 1] = '\0';
-        return mountzero_susfs_add_path(path);
-    }
+            irule->virtual_path = kmemdup_nul(v_tmp, cur_v_len, GFP_KERNEL);
+            irule->real_path = slash_r ? kmemdup_nul(r_tmp, cur_r_len, GFP_KERNEL) : kstrdup("/", GFP_KERNEL);
+            if (unlikely(!irule->virtual_path || !irule->real_path)) {
+                if (irule->virtual_path) kfree(irule->virtual_path);
+                if (irule->real_path) kfree(irule->real_path);
+                kmem_cache_free(mz_rule_cachep, irule);
+                pending_rules[p_count - 1] = NULL;
+                err = -ENOMEM;
+                break;
+            }
 
-    case MOUNTZERO_IOC_ADD_SUS_MAP: {
-        char path[256];
-        if (copy_from_user(path, (void __user *)arg, sizeof(path)))
-            return -EFAULT;
-        path[sizeof(path) - 1] = '\0';
-        return mountzero_susfs_add_map(path);
-    }
+            b_slash = strrchr(irule->virtual_path, '/');
+            b_name_inter = b_slash ? b_slash + 1 : irule->virtual_path;
+            irule->basename = b_name_inter;
+            irule->b_len = (u16)strlen(b_name_inter);
+            irule->v_hash = h_inter;
+            irule->flags = MZ_FLAG_IS_DIR;
 
-    case MOUNTZERO_IOC_SET_UNAME: {
-        struct mz_uname_info uname_info;
-        if (copy_from_user(&uname_info, (void __user *)arg, sizeof(uname_info)))
-            return -EFAULT;
-        uname_info.kernel_release[sizeof(uname_info.kernel_release) - 1] = '\0';
-        uname_info.kernel_version[sizeof(uname_info.kernel_version) - 1] = '\0';
-        return mountzero_do_spoof_uname(uname_info.kernel_release, uname_info.kernel_version);
-    }
+            irule->virt_node.dev = 0;
+            irule->virt_node.ino = (unsigned long)h_inter;
+            irule->virt_node.len = (u16)cur_v_len;
+            irule->virt_node.type = MZ_INO_TYPE_VIRTUAL;
+            irule->real_node.ino = 0;
+            irule->real_node.dev = 0;
+            irule->real_node.len = (u16)(slash_r ? cur_r_len : 1);
+            irule->real_node.type = MZ_INO_TYPE_REAL;
 
-    case MOUNTZERO_IOC_RESET_UNAME: {
-        return mountzero_reset_uname();
-    }
-
-    case MOUNTZERO_IOC_GET_UNAME_STATUS: {
-        struct mz_uname_status status;
-        char buf[256];
-        int len;
-        memset(&status, 0, sizeof(status));
-        len = mountzero_get_uname_status(buf, sizeof(buf));
-        /* Parse key=value pairs from buf */
-        if (len > 0) {
-            char *p = buf;
-            while (p && *p) {
-                if (strncmp(p, "spoofed=", 8) == 0)
-                    status.spoofed = simple_strtol(p + 8, NULL, 10);
-                else if (strncmp(p, "release=", 8) == 0)
-                    strncpy(status.release, p + 8, sizeof(status.release) - 1);
-                else if (strncmp(p, "version=", 8) == 0)
-                    strncpy(status.version, p + 8, sizeof(status.version) - 1);
-                else if (strncmp(p, "stock_release=", 14) == 0)
-                    strncpy(status.stock_release, p + 14, sizeof(status.stock_release) - 1);
-                else if (strncmp(p, "stock_version=", 14) == 0)
-                    strncpy(status.stock_version, p + 14, sizeof(status.stock_version) - 1);
-                p = strchr(p, '\n');
-                if (p) p++;
+            if (slash_r) {
+                if (likely(kern_path(irule->real_path, LOOKUP_FOLLOW, &r_path_struct) == 0)) {
+                    irule->real_node.ino = d_backing_inode(r_path_struct.dentry)->i_ino;
+                    irule->real_node.dev = r_path_struct.dentry->d_sb->s_dev;
+                    path_put(&r_path_struct);
+                }
             }
         }
-        if (copy_to_user((void __user *)arg, &status, sizeof(status)))
-            return -EFAULT;
-        return 0;
-    }
-#endif
-
-    default:
-        return -EINVAL;
+        current_flags = MZ_FLAG_IS_DIR;
     }
 
-    return ret;
+    while (p_count > 0) {
+        p_count--;
+        if (slashes_v[p_count]) *slashes_v[p_count] = '/';
+        if (slashes_r[p_count]) *slashes_r[p_count] = '/';
+
+        if (pending_rules[p_count]) {
+            irule = pending_rules[p_count];
+
+            if (likely(err == 0)) {
+                u32 bh = full_name_hash(NULL, irule->basename, irule->b_len);
+                irule->virt_node.dev = inherited_dev;
+                irule->v_fs_type = inherited_fs_type;
+
+                hash_add_rcu(mountzero_basenames_ht, &irule->basename_node, bh);
+                hash_add_rcu(mountzero_rules_ht, &irule->vpath_node, irule->v_hash);
+                if (irule->real_node.ino) hash_add_rcu(mountzero_inodes_ht, &irule->real_node.node, irule->real_node.ino);
+                hash_add_rcu(mountzero_inodes_ht, &irule->virt_node.node, irule->virt_node.ino);
+                
+                list_add_tail_rcu(&irule->list, &mountzero_rules_list);
+                atomic_inc(&mz_active_rules);
+                if (atomic_read(&mz_active_rules) == 1) static_branch_enable(&mountzero_active_rules);
+            } else {
+                kfree(irule->virtual_path);
+                kfree(irule->real_path);
+                kmem_cache_free(mz_rule_cachep, irule);
+            }
+        }
+    }
+
+    if (likely(err == 0)) {
+        rule->virt_node.dev = inherited_dev;
+        rule->v_fs_type = inherited_fs_type;
+    }
+
+    return err;
 }
 
-static int mountzero_dev_open(struct inode *inode, struct file *file)
+/*** Rule Operations ***/
+
+static int __mountzero_add_rule(const char *v_path, const char *r_path, u16 v_len, u16 r_len, u32 flags)
 {
-    if (!uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
-        pr_warn("MountZero: Permission denied for uid %d\n", current_euid().val);
-        return -EPERM;
+    struct mountzero_rule *rule, *existing, *victim = NULL;
+    struct path path_main, r_path_struct_main;
+    struct dentry *r_path_dentry = NULL;
+    char *slash;
+    const char *b_name;
+    u32 hash, b_hash;
+    int err = 0;
+    bool v_path_exists = false; 
+
+    if (!v_path || !r_path) return -EINVAL;
+
+    hash = full_name_hash(NULL, v_path, v_len);
+    rule = kmem_cache_alloc(mz_rule_cachep, GFP_KERNEL);
+    if (!rule)
+        return -ENOMEM;
+
+    rule->virtual_path = kmemdup_nul(v_path, v_len, GFP_KERNEL);
+    rule->real_path = kmemdup_nul(r_path, r_len, GFP_KERNEL);
+
+    if (!rule->virtual_path || !rule->real_path) {
+        if (rule->virtual_path) kfree(rule->virtual_path);
+        if (rule->real_path) kfree(rule->real_path);
+        kmem_cache_free(mz_rule_cachep, rule);
+        return -ENOMEM;
     }
+
+    INIT_LIST_HEAD(&rule->list);
+    INIT_HLIST_NODE(&rule->vpath_node);
+    INIT_HLIST_NODE(&rule->basename_node);
+
+    slash = strrchr(rule->virtual_path, '/');
+    b_name = slash ? slash + 1 : rule->virtual_path;
+    rule->basename = b_name;
+    rule->b_len = strlen(b_name);
+    rule->v_hash = hash;
+    rule->flags = flags;
+
+    rule->real_node.ino = 0;
+    rule->real_node.dev = 0;
+    rule->real_node.len = r_len;
+    rule->real_node.type = MZ_INO_TYPE_REAL;
+    rule->virt_node.ino = 0;
+    rule->virt_node.dev = 0;
+    rule->virt_node.len = v_len;
+    rule->virt_node.type = MZ_INO_TYPE_VIRTUAL;
+
+    if (kern_path(rule->real_path, LOOKUP_FOLLOW, &r_path_struct_main) == 0) {
+        struct inode *r_inode = d_backing_inode(r_path_struct_main.dentry);
+        rule->real_node.ino = r_inode->i_ino;
+        rule->real_node.dev = r_path_struct_main.dentry->d_sb->s_dev;
+        if (S_ISDIR(r_inode->i_mode)) rule->flags |= MZ_FLAG_IS_DIR;
+        r_path_dentry = dget(r_path_struct_main.dentry);
+        path_put(&r_path_struct_main);
+    }
+
+    if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &path_main) == 0) {
+        rule->virt_node.ino = d_backing_inode(path_main.dentry)->i_ino;
+        rule->virt_node.dev = path_main.dentry->d_sb->s_dev;
+        if (path_main.dentry->d_sb->s_op->statfs) {
+            struct kstatfs st;
+            path_main.dentry->d_sb->s_op->statfs(path_main.dentry, &st);
+            rule->v_fs_type = st.f_type;
+        } else {
+            rule->v_fs_type = path_main.dentry->d_sb->s_magic;
+        }
+        path_put(&path_main);
+        v_path_exists = true;
+        mz_debug("Resolved physical backing for %s (ino: %lu)\n", rule->virtual_path, rule->virt_node.ino);
+    } else {
+        rule->virt_node.ino = (unsigned long)hash;
+    }
+
+    mutex_lock(&mountzero_write_mutex);
+    hash_for_each_possible(mountzero_rules_ht, existing, vpath_node, hash) {
+        if (existing->v_hash == hash && existing->virt_node.len == v_len &&
+             memcmp(existing->virtual_path, rule->virtual_path, v_len) == 0) {
+            hash_del_rcu(&existing->vpath_node);
+            hash_del_rcu(&existing->basename_node);
+            if (existing->real_node.ino) hash_del_rcu(&existing->real_node.node);
+            if (existing->virt_node.ino) hash_del_rcu(&existing->virt_node.node);
+            list_del_rcu(&existing->list);
+            atomic_dec(&mz_active_rules);
+            victim = existing;
+            mz_info("Shadowing existing rule for: %s\n", rule->virtual_path);
+            break;
+        }
+    }
+
+    if (!v_path_exists) {
+        err = mountzero_generate_virtual_topology(rule);
+        if (err != 0) {
+            mutex_unlock(&mountzero_write_mutex);
+            if (r_path_dentry) dput(r_path_dentry);
+            kfree(rule->virtual_path);
+            kfree(rule->real_path);
+            kmem_cache_free(mz_rule_cachep, rule);
+            return err;
+        }
+    }
+    
+    if (r_path_dentry)
+        __mountzero_collect_parents(rule, r_path_dentry);
+
+    b_hash = full_name_hash(NULL, rule->basename, rule->b_len);
+    hash_add_rcu(mountzero_basenames_ht, &rule->basename_node, b_hash);
+    hash_add_rcu(mountzero_rules_ht, &rule->vpath_node, hash);
+
+    if (rule->real_node.ino)
+        hash_add_rcu(mountzero_inodes_ht, &rule->real_node.node, rule->real_node.ino);
+
+    if (rule->virt_node.ino)
+        hash_add_rcu(mountzero_inodes_ht, &rule->virt_node.node, rule->virt_node.ino);
+
+    list_add_tail_rcu(&rule->list, &mountzero_rules_list);
+    atomic_inc(&mz_active_rules);
+    if (atomic_read(&mz_active_rules) == 1) static_branch_enable(&mountzero_active_rules);
+    mutex_unlock(&mountzero_write_mutex);
+
+    if (unlikely(victim)) {
+        synchronize_rcu();
+        kfree(victim->virtual_path);
+        kfree(victim->real_path);
+        kmem_cache_free(mz_rule_cachep, victim);
+    }
+
+    mz_info("Successfully added rule: %s -> %s\n", rule->virtual_path, rule->real_path);
     return 0;
 }
 
-static int mountzero_dev_release(struct inode *inode, struct file *file)
+static void __mountzero_del_rule(const char *v_path, size_t v_len,
+                               struct list_head *r_victims,
+                               struct hlist_head *d_victims)
 {
-    return 0;
+    struct mountzero_rule *rule;
+    u32 hash = full_name_hash(NULL, v_path, v_len);
+
+    hash_for_each_possible(mountzero_rules_ht, rule, vpath_node, hash) {
+        if (rule->v_hash == hash && rule->virt_node.len == v_len &&
+            memcmp(rule->virtual_path, v_path, v_len) == 0) {
+            hash_del_rcu(&rule->vpath_node);
+            hash_del_rcu(&rule->basename_node);
+            if (rule->real_node.ino) hash_del_rcu(&rule->real_node.node);
+            if (rule->virt_node.ino) hash_del_rcu(&rule->virt_node.node);
+            list_del_rcu(&rule->list);
+            atomic_dec(&mz_active_rules);
+            if (atomic_read(&mz_active_rules) == 0) static_branch_disable(&mountzero_active_rules);
+            list_add_tail(&rule->list, r_victims);
+            if (rule->parent_dir)
+                __mountzero_delete_child_locked(rule->parent_dir, hash, d_victims);
+            break;
+        }
+    }
+}
+
+static void __mountzero_clear_all(void)
+{
+    struct mountzero_rule *rule, *tmp_rule;
+    struct mountzero_dir_node *dir_node, *tmp_dir;
+    struct mountzero_uid_node *uid_node;
+    struct mz_inode_node *inode_node;
+    struct hlist_node *hlist_tmp;
+    struct mz_child_array *array;
+    LIST_HEAD(rule_victims);
+    LIST_HEAD(dir_victims);
+    HLIST_HEAD(uid_victims);
+    int bkt;
+
+    list_for_each_entry_safe(rule, tmp_rule, &mountzero_rules_list, list) {
+        hash_del_rcu(&rule->vpath_node);
+        hash_del_rcu(&rule->basename_node);
+        if (rule->real_node.ino) hash_del_rcu(&rule->real_node.node);
+        if (rule->virt_node.ino) hash_del_rcu(&rule->virt_node.node);
+        list_move_tail(&rule->list, &rule_victims);
+    }
+
+    hash_for_each_safe(mountzero_uid_ht, bkt, hlist_tmp, uid_node, node) {
+        hash_del_rcu(&uid_node->node);
+        hlist_add_head(&uid_node->node, &uid_victims);
+    }
+
+    hash_for_each_safe(mountzero_inodes_ht, bkt, hlist_tmp, inode_node, node) {
+        if (inode_node->type & MZ_INO_TYPE_DIR) {
+            dir_node = container_of(inode_node, struct mountzero_dir_node, dir);
+            hash_del_rcu(&inode_node->node);
+            array = rcu_dereference_protected(dir_node->child_array, 1);
+            if (array) kfree_rcu(array, rcu);
+            if (dir_node->is_private) list_del_rcu(&dir_node->private_list);
+            list_add_tail(&dir_node->private_list, &dir_victims);
+        }
+    }
+
+    atomic_set(&mz_active_rules, 0);
+    atomic_set(&mz_active_dirs, 0);
+    atomic_set(&mz_active_uids, 0);
+    static_branch_disable(&mountzero_active_rules);
+    static_branch_disable(&mountzero_active_dirs);
+    static_branch_disable(&mountzero_active_uids);
+    INIT_LIST_HEAD(&mountzero_private_dirs_list);
+    synchronize_rcu();
+
+    list_for_each_entry_safe(dir_node, tmp_dir, &dir_victims, private_list) {
+        kfree(dir_node->dir_path);
+        kmem_cache_free(mz_dir_cachep, dir_node);
+    }
+    list_for_each_entry_safe(rule, tmp_rule, &rule_victims, list) {
+        kfree(rule->virtual_path);
+        kfree(rule->real_path);
+        kmem_cache_free(mz_rule_cachep, rule);
+    }
+    hlist_for_each_entry_safe(uid_node, hlist_tmp, &uid_victims, node) {
+        kmem_cache_free(mz_uid_cachep, uid_node);
+    }
+}
+
+
+/*** IOCTL Interface (original MountZero compat) ***/
+
+static long mountzero_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	void __user *uarg = (void __user *)arg;
+
+	switch (cmd) {
+
+	case MOUNTZERO_IOC_ADD_REDIRECT: {
+		struct mz_ioctl_rule rule;
+		int ret;
+		if (copy_from_user(&rule, uarg, sizeof(rule)))
+			return -EFAULT;
+		rule.virtual_path[sizeof(rule.virtual_path) - 1] = '\0';
+		rule.real_path[sizeof(rule.real_path) - 1] = '\0';
+		ret = __mountzero_add_rule(rule.virtual_path, rule.real_path,
+					   strlen(rule.virtual_path), strlen(rule.real_path),
+					   rule.flags);
+		if (ret) mz_err("IOCTL ADD failed: %s -> %s (err %d)\n",
+				 rule.virtual_path, rule.real_path, ret);
+		else mz_info("IOCTL ADD: %s -> %s\n", rule.virtual_path, rule.real_path);
+		return ret;
+	}
+
+	case MOUNTZERO_IOC_DEL_REDIRECT: {
+		struct mz_ioctl_path ipath;
+		struct mz_inode_node *inode_node;
+		struct mountzero_dir_node *dir;
+		struct hlist_node *tmp_d;
+		struct mountzero_rule *rule, *tmp_r;
+		LIST_HEAD(r_victims);
+		HLIST_HEAD(d_victims);
+		if (copy_from_user(&ipath, uarg, sizeof(ipath)))
+			return -EFAULT;
+		ipath.virtual_path[sizeof(ipath.virtual_path) - 1] = '\0';
+		mutex_lock(&mountzero_write_mutex);
+		__mountzero_del_rule(ipath.virtual_path, strlen(ipath.virtual_path),
+				     &r_victims, &d_victims);
+		mutex_unlock(&mountzero_write_mutex);
+		if (list_empty(&r_victims)) return -ENOENT;
+		synchronize_rcu();
+		hlist_for_each_entry_safe(inode_node, tmp_d, &d_victims, node) {
+			dir = container_of(inode_node, struct mountzero_dir_node, dir);
+			kfree(dir->dir_path);
+			kmem_cache_free(mz_dir_cachep, dir);
+		}
+		list_for_each_entry_safe(rule, tmp_r, &r_victims, list) {
+			mz_info("IOCTL DEL: %s\n", rule->virtual_path);
+			kfree(rule->virtual_path);
+			kfree(rule->real_path);
+			kmem_cache_free(mz_rule_cachep, rule);
+		}
+		return 0;
+	}
+
+	case MOUNTZERO_IOC_CLEAR:
+		mutex_lock(&mountzero_write_mutex);
+		__mountzero_clear_all();
+		mutex_unlock(&mountzero_write_mutex);
+		mz_info("IOCTL CLEAR: all rules removed\n");
+		return 0;
+
+	case MOUNTZERO_IOC_LIST: {
+		struct mz_ioctl_list klist;
+		struct mountzero_rule *rule;
+		int off = 0, cnt = 0;
+		if (copy_from_user(&klist, uarg, sizeof(klist)))
+			return -EFAULT;
+		memset(klist.entries, 0, sizeof(klist.entries));
+		rcu_read_lock();
+		list_for_each_entry_rcu(rule, &mountzero_rules_list, list) {
+			int vlen = strlen(rule->virtual_path);
+			int rlen = strlen(rule->real_path);
+			int need = vlen + 4 + rlen + 2;
+			if (off + need < (int)sizeof(klist.entries)) {
+				memcpy(klist.entries + off, rule->virtual_path, vlen);
+				off += vlen;
+				klist.entries[off++] = ' ';
+				klist.entries[off++] = '-';
+				klist.entries[off++] = '>';
+				klist.entries[off++] = ' ';
+				memcpy(klist.entries + off, rule->real_path, rlen);
+				off += rlen;
+				klist.entries[off++] = '\n';
+				cnt++;
+			}
+		}
+		rcu_read_unlock();
+		klist.count = cnt;
+		if (copy_to_user(uarg, &klist, sizeof(klist)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case MOUNTZERO_IOC_BLOCK_UID: {
+		unsigned int uid;
+		struct mountzero_uid_node *entry;
+		if (copy_from_user(&uid, uarg, sizeof(uid)))
+			return -EFAULT;
+		if (mountzero_is_uid_blocked(uid)) return -EEXIST;
+		entry = kmem_cache_alloc(mz_uid_cachep, GFP_KERNEL);
+		if (!entry) return -ENOMEM;
+		entry->uid = uid;
+		mutex_lock(&mountzero_write_mutex);
+		hash_add_rcu(mountzero_uid_ht, &entry->node, uid);
+		atomic_inc(&mz_active_uids);
+		if (atomic_read(&mz_active_uids) == 1) static_branch_enable(&mountzero_active_uids);
+		mutex_unlock(&mountzero_write_mutex);
+		mz_info("IOCTL BLOCK_UID: %u\n", uid);
+		return 0;
+	}
+
+	case MOUNTZERO_IOC_UNBLOCK_UID: {
+		unsigned int uid;
+		struct mountzero_uid_node *entry;
+		struct hlist_node *tmp;
+		int bkt;
+		bool found = false;
+		if (copy_from_user(&uid, uarg, sizeof(uid)))
+			return -EFAULT;
+		mutex_lock(&mountzero_write_mutex);
+		hash_for_each_safe(mountzero_uid_ht, bkt, tmp, entry, node) {
+			if (entry->uid == uid) {
+				hash_del_rcu(&entry->node);
+				found = true;
+				break;
+			}
+		}
+		if (atomic_read(&mz_active_uids) > 0) {
+			atomic_dec(&mz_active_uids);
+			if (atomic_read(&mz_active_uids) == 0)
+				static_branch_disable(&mountzero_active_uids);
+		}
+		mutex_unlock(&mountzero_write_mutex);
+		if (found) {
+			synchronize_rcu();
+			kmem_cache_free(mz_uid_cachep, entry);
+		}
+		mz_info("IOCTL UNBLOCK_UID: %u\n", uid);
+		return found ? 0 : -ENOENT;
+	}
+
+	default:
+		return -ENOTTY;
+	}
 }
 
 static const struct file_operations mountzero_fops = {
-    .owner = THIS_MODULE,
-    .open = mountzero_dev_open,
-    .release = mountzero_dev_release,
-    .unlocked_ioctl = mountzero_ioctl,
-#ifdef CONFIG_COMPAT
-    .compat_ioctl = mountzero_ioctl,
-#endif
+	.owner          = THIS_MODULE,
+	.unlocked_ioctl = mountzero_ioctl,
 };
 
-static struct miscdevice mountzero_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "mountzero",
-    .fops = &mountzero_fops,
+static struct miscdevice mountzero_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "mountzero",
+	.fops  = &mountzero_fops,
 };
 
-int __init mountzero_init(void)
-{
-    int ret;
+/*** Sysfs interface (original MountZero compat) ***/
 
-    pr_info("MountZero: Initializing MountZero v%s (Enhanced)\n", MOUNTZERO_VERSION);
+static struct kobject *mountzero_kobj;
 
-    hash_init(mz_redirect_rules_ht);
-    hash_init(mz_bind_rules_ht);
-    hash_init(mz_hide_rules_ht);
-    hash_init(mz_sus_path_ht);
-    hash_init(mz_sus_map_ht);
-    hash_init(mz_ino_ht);
+static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+	return sprintf(buf, "%d\n", MOUNTZERO_VERSION);
+}
+static struct kobj_attribute version_attr = __ATTR_RO(version);
 
-    bitmap_zero(mz_bloom, MZ_BLOOM_BITS);
+static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+	return sprintf(buf, "enabled\n");
+}
+static struct kobj_attribute status_attr = __ATTR_RO(status);
 
-    ret = misc_register(&mountzero_misc);
-    if (ret) {
-        pr_err("MountZero: Failed to register misc device: %d\n", ret);
-        return ret;
-    }
+static int __init mountzero_init(void) {
+	int ret;
 
-    atomic_set(&mountzero_enabled, 1);
+	hash_init(mountzero_rules_ht);
+	hash_init(mountzero_basenames_ht);
+	hash_init(mountzero_uid_ht);
+	hash_init(mountzero_inodes_ht);
 
-    /* Create sysfs entries */
-    ret = sysfs_create_group(kernel_kobj, &mz_attr_group);
-    if (ret)
-        pr_warn("MountZero: Failed to create sysfs group: %d\n", ret);
+	mz_rule_cachep = kmem_cache_create("mz_rules", sizeof(struct mountzero_rule), 0, SLAB_HWCACHE_ALIGN, NULL);
+	mz_dir_cachep = kmem_cache_create("mz_dirs", sizeof(struct mountzero_dir_node), 0, SLAB_HWCACHE_ALIGN, NULL);
+	mz_uid_cachep = kmem_cache_create("mz_uids", sizeof(struct mountzero_uid_node), 0, SLAB_HWCACHE_ALIGN, NULL);
 
-    /* Create guard sysfs subdirectory */
-    mz_guard_kobj = kobject_create_and_add("mountzero_guard", kernel_kobj);
-    if (mz_guard_kobj) {
-        ret = sysfs_create_group(mz_guard_kobj, &mz_guard_attr_group);
-        if (ret) {
-            pr_warn("MountZero: Failed to create guard sysfs: %d\n", ret);
-            kobject_put(mz_guard_kobj);
-            mz_guard_kobj = NULL;
-        }
-    }
+	if (!mz_rule_cachep || !mz_dir_cachep || !mz_uid_cachep) {
+		mz_err("Failed to allocate memory slab caches\n");
+		if (mz_rule_cachep) kmem_cache_destroy(mz_rule_cachep);
+		if (mz_dir_cachep) kmem_cache_destroy(mz_dir_cachep);
+		if (mz_uid_cachep) kmem_cache_destroy(mz_uid_cachep);
+		return -ENOMEM;
+	}
 
-    /* Save stock kernel version for uname reset */
-#ifdef CONFIG_KSU_SUSFS
-    mz_save_stock_uname();
-#endif
+	ret = misc_register(&mountzero_dev);
+	if (ret) {
+		mz_err("Failed to register misc device (err: %d)\n", ret);
+		kmem_cache_destroy(mz_rule_cachep);
+		kmem_cache_destroy(mz_dir_cachep);
+		kmem_cache_destroy(mz_uid_cachep);
+		return ret;
+	}
 
-    pr_info("MountZero: Device registered at /dev/mountzero (minor=%d)\n",
-            mountzero_misc.minor);
-    pr_info("MountZero: Sysfs at /sys/kernel/mountzero/\n");
+	mountzero_kobj = kobject_create_and_add("mountzero", kernel_kobj);
+	if (mountzero_kobj) {
+		if (sysfs_create_file(mountzero_kobj, &version_attr.attr))
+			mz_warn("Failed to create version sysfs entry\n");
+		if (sysfs_create_file(mountzero_kobj, &status_attr.attr))
+			mz_warn("Failed to create status sysfs entry\n");
+	}
 
-    /* Start hot-plug thread */
-    mz_hotplug_thread = kthread_run(mz_hotplug_thread_fn, NULL, "mz_hotplug");
-    if (IS_ERR(mz_hotplug_thread)) {
-        pr_warn("MountZero: Failed to start hot-plug thread\n");
-        mz_hotplug_thread = NULL;
-    }
-
-    return 0;
+	mz_info("Loaded successfully (IOCTL: /dev/mountzero)\n");
+	return 0;
 }
 
-void __exit mountzero_exit(void)
-{
-    struct mz_rule *rule;
-    struct hlist_node *tmp;
-    int bkt;
-    unsigned long irq_flags;
-
-    /* Stop hot-plug thread */
-    if (mz_hotplug_thread) {
-        kthread_stop(mz_hotplug_thread);
-        mz_hotplug_thread = NULL;
-    }
-
-    spin_lock_irqsave(&mz_lock, irq_flags);
-
-    hash_for_each_safe(mz_redirect_rules_ht, bkt, tmp, rule, node) {
-        hash_del(&rule->node);
-        if (!hlist_unhashed(&rule->ino_node))
-            hash_del(&rule->ino_node);
-        kfree(rule->virtual_path);
-        kfree(rule->real_path);
-        kfree(rule);
-    }
-
-    hash_for_each_safe(mz_ino_ht, bkt, tmp, rule, ino_node) {
-        hash_del(&rule->ino_node);
-        kfree(rule->virtual_path);
-        kfree(rule->real_path);
-        kfree(rule);
-    }
-
-    spin_unlock_irqrestore(&mz_lock, irq_flags);
-
-    /* Remove sysfs entries */
-    if (mz_guard_kobj) {
-        kobject_put(mz_guard_kobj);
-        mz_guard_kobj = NULL;
-    }
-    sysfs_remove_group(kernel_kobj, &mz_attr_group);
-
-    misc_deregister(&mountzero_misc);
-    pr_info("MountZero: Module unloaded\n");
-}
-
-module_init(mountzero_init);
-module_exit(mountzero_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Mastermind");
-MODULE_DESCRIPTION("MountZero - Enhanced VFS path redirection, SUSFS bridge, and module auto-scanning");
-MODULE_VERSION(MOUNTZERO_VERSION);
+fs_initcall(mountzero_init);

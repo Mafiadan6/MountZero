@@ -25,7 +25,7 @@
   </div>
     <div class="header-title">
       <span class="title-main">MountZero</span>
-      <span class="title-sub">VFS Manager v2.0.3</span>
+      <span class="title-sub">VFS Manager v3.2.0</span>
     </div>
   </div>
   <div class="header-right">
@@ -79,6 +79,13 @@
         <path d="M7 10l2 2 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       <span>Guard</span>
+    </button>
+    <button class="tab" data-tab="exclusions">
+      <svg class="tab-icon" viewBox="0 0 20 20" fill="none">
+        <path d="M10 3L4 6v5c0 3.5 2.5 6.5 6 7.5 3.5-1 6-4 6-7.5V6L10 3z" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M7 10l2 2 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>Exclusions</span>
     </button>
     <button class="tab" data-tab="hiding">
       <svg class="tab-icon" viewBox="0 0 20 20" fill="none">
@@ -454,6 +461,56 @@
     </div>
   </section>
 
+  <!-- ==================== EXCLUSIONS TAB ==================== -->
+  <section id="tab-exclusions" class="tab-content">
+    <div class="glass-card">
+      <div class="card-header">
+        <div class="card-header-icon cyan">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M10 3L4 6v5c0 3.5 2.5 6.5 6 7.5 3.5-1 6-4 6-7.5V6L10 3z" stroke="currentColor" stroke-width="1.5"/><path d="M7 10l2 2 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <h2>UID Exclusions</h2>
+        <div class="card-badge" id="exclusion-count-pill">0 apps</div>
+      </div>
+      <p style="color:var(--text-secondary);font-size:12px;margin:0 0 12px 0;">Block specific apps from seeing VFS rules (root hiding per-app). Excluded apps will see the original filesystem.</p>
+      <div id="exclusion-list" class="list-container">
+        <div class="list-empty">No exclusions yet</div>
+      </div>
+      <div class="action-row" style="margin-top:12px">
+        <button id="btn-add-exclusion" class="btn btn-success" style="flex:1">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M10 5v10M5 10h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          Add App Exclusion
+        </button>
+        <button id="btn-clear-exclusions" class="btn btn-danger" style="flex:1">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M4 7h12M6 7V5a1 1 0 011-1h6a1 1 0 011 1v2m2 0l-1 9a1 1 0 01-1 1H7a1 1 0 01-1-1L5 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Clear All
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== App Selector Modal ==================== -->
+  <div id="app-selector-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Select App to Exclude</h2>
+        <button id="btn-close-modal" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-search">
+        <input type="text" id="app-search-input" class="neon-input" placeholder="Search apps...">
+        <label class="toggle-row" style="margin:8px 0 0 0">
+          <span class="toggle-label" style="font-size:12px">Show system apps</span>
+          <div class="toggle-switch" style="transform:scale(0.8)">
+            <input type="checkbox" id="switch-system-apps">
+            <span class="toggle-thumb"></span>
+          </div>
+        </label>
+      </div>
+      <div id="app-list-container" class="modal-app-list">
+        <div class="list-empty">Loading apps...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- ==================== HIDING TAB ==================== -->
   <section id="tab-hiding" class="tab-content">
 
@@ -524,6 +581,20 @@
           <span class="toggle-label">Hide /sdcard/Android data</span>
           <div class="toggle-switch">
             <input type="checkbox" id="cfg-hide-sdcard-android">
+            <span class="toggle-thumb"></span>
+          </div>
+        </label>
+        <label class="toggle-row">
+          <span class="toggle-label">Hide LSPosed injection traces</span>
+          <div class="toggle-switch">
+            <input type="checkbox" id="cfg-hide-lsposed" checked>
+            <span class="toggle-thumb"></span>
+          </div>
+        </label>
+        <label class="toggle-row">
+          <span class="toggle-label">Hide loop devices & PTYs</span>
+          <div class="toggle-switch">
+            <input type="checkbox" id="cfg-hide-loops" checked>
             <span class="toggle-thumb"></span>
           </div>
         </label>
@@ -836,7 +907,7 @@
 
 <!-- Footer -->
 <footer>
-  <span class="footer-text">MountZero VFS v2.0.3</span>
+  <span class="footer-text">MountZero VFS v3.2.0</span>
   <span class="footer-dot"></span>
   <span class="footer-author">&copy; 爪卂丂ㄒ乇尺爪工刀ᗪ</span>
 </footer>

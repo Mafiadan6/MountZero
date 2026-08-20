@@ -1,0 +1,229 @@
+diff --git a/fs/Kconfig b/fs/Kconfig
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -330,6 +330,13 @@ source "fs/nls/Kconfig"
+ source "fs/dlm/Kconfig"
+ source "fs/unicode/Kconfig"
+ 
++config MOUNTZERO
++	bool "MountZero VFS Path Redirection"
++	default y
++	help
++	  MountZero provides VFS path redirection, directory hiding,
++	  and mmap metadata spoofing for systemless module support.
++
+ endmenu
+diff --git a/fs/Makefile b/fs/Makefile
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -22,6 +22,8 @@ else
+ obj-y +=	no-block.o
+ endif
+ 
++obj-$(CONFIG_MOUNTZERO) += mountzero.o
++
+ obj-$(CONFIG_PROC_FS) += proc_namespace.o
+ 
+diff --git a/fs/namei.c b/fs/namei.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -140,6 +140,11 @@
+ 
+ #define EMBEDDED_NAME_MAX	(PATH_MAX - offsetof(struct filename, iname))
+ 
++#ifdef CONFIG_MOUNTZERO
++extern struct filename *mountzero_handle_getname(struct filename *name);
++extern int mountzero_handle_permission(struct inode *inode, int mask);
++#endif
++
+ struct filename *
+ getname_flags(const char __user *filename, int flags, int *empty)
+ {
+@@ -220,6 +225,11 @@
+ 	result->uptr = filename;
+ 	result->aname = NULL;
++#ifdef CONFIG_MOUNTZERO
++	if (!IS_ERR(result)) {
++		result = mountzero_handle_getname(result);
++	}
++#endif
+ 	audit_getname(result);
+ 	return result;
+ }
+@@ -265,6 +275,11 @@
+ 	result->uptr = NULL;
+ 	result->aname = NULL;
+ 	result->refcnt = 1;
++#ifdef CONFIG_MOUNTZERO
++	if (!IS_ERR(result)) {
++		result = mountzero_handle_getname(result);
++	}
++#endif
+ 	audit_getname(result);
+ 
+ 	return result;
+@@ -362,6 +377,12 @@
+ {
+ 	int ret;
+ 
++#ifdef CONFIG_MOUNTZERO
++	int nm_perm = mountzero_handle_permission(inode, mask);
++	if (unlikely(nm_perm < 0)) return nm_perm;
++	if (unlikely(nm_perm > 0)) return 0;
++#endif
++
+ 	/*
+ 	 * Do the basic permission checks.
+ 	 */
+@@ -444,6 +465,12 @@
+ {
+ 	int retval;
+ 
++#ifdef CONFIG_MOUNTZERO
++	int nm_perm = mountzero_handle_permission(inode, mask);
++	if (unlikely(nm_perm < 0)) return nm_perm;
++	if (unlikely(nm_perm > 0)) return 0;
++#endif
++
+ 	if (unlikely(mask & MAY_WRITE)) {
+ 		/*
+ 		 * Nobody gets write access to an immutable file.
+diff --git a/fs/dcache.c b/fs/dcache.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -3352,6 +3352,10 @@
+ 	} while (read_seqcount_retry(&fs->seq, seq));
+ }
+ 
++#ifdef CONFIG_MOUNTZERO
++extern char *mountzero_handle_dpath(const struct path *path, char *buf, int buflen);
++#endif
++
+ /**
+  * d_path - return the path of a dentry
+  * @path: path to report
+@@ -3374,6 +3378,13 @@
+ 	char *res = buf + buflen;
+ 	struct path root;
+ 	int error;
+ 
++#ifdef CONFIG_MOUNTZERO
++	char *nm_path = mountzero_handle_dpath(path, buf, buflen);
++	if (unlikely(nm_path)) {
++		return nm_path;
++	}
++#endif
++
+ 	/*
+ 	 * We have various synthetic filesystems that never get mounted.  On
+ 	 * these filesystems dentries are never used for lookup purposes, and
+diff --git a/fs/readdir.c b/fs/readdir.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@ -23,6 +23,10 @@
+ 
+ #include <linux/uaccess.h>
+ 
++#ifdef CONFIG_MOUNTZERO
++extern int mountzero_handle_iterate_dir(struct file *file, struct dir_context *ctx);
++#endif
++
+ int iterate_dir(struct file *file, struct dir_context *ctx)
+ {
+ 	struct inode *inode = file_inode(file);
+@@ -48,10 +52,14 @@
+ 	res = -ENOENT;
+ 	if (!IS_DEADDIR(inode)) {
+ 		ctx->pos = file->f_pos;
++#ifdef CONFIG_MOUNTZERO
++		res = mountzero_handle_iterate_dir(file, ctx);
++#else
+ 		if (shared)
+ 			res = file->f_op->iterate_shared(file, ctx);
+ 		else
+ 			res = file->f_op->iterate(file, ctx);
++#endif
+ 		file->f_pos = ctx->pos;
+ 		fsnotify_access(file);
+ 		file_accessed(file);
+diff --git a/fs/stat.c b/fs/stat.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -102,6 +102,10 @@
+ }
+ EXPORT_SYMBOL(vfs_getattr_nosec);
+ 
++#ifdef CONFIG_MOUNTZERO
++extern int mountzero_handle_getattr(int ret, const struct path *path, struct kstat *stat);
++#endif
++
+ /*
+  * vfs_getattr - Get the enhanced basic attributes of a file
+  * @path: The file of interest
+@@ -133,7 +137,11 @@
+ 	retval = security_inode_getattr(path);
+ 	if (retval)
+ 		return retval;
++#ifdef CONFIG_MOUNTZERO
++	return mountzero_handle_getattr(vfs_getattr_nosec(path, stat, request_mask, query_flags), path, stat);
++#else
+ 	return vfs_getattr_nosec(path, stat, request_mask, query_flags);
++#endif
+ }
+ EXPORT_SYMBOL(vfs_getattr);
+ 
+diff --git a/fs/statfs.c b/fs/statfs.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@ -11,6 +11,10 @@
+ #include <linux/compat.h>
+ #include "internal.h"
+ 
++#ifdef CONFIG_MOUNTZERO
++extern void mountzero_spoof_statfs(const struct path *path, struct kstatfs *buf);
++#endif
++
+ static int flags_by_mnt(int mnt_flags)
+ {
+ 	int flags = 0;
+@@ -74,6 +78,9 @@
+ 	error = statfs_by_dentry(path->dentry, buf);
+ 	if (!error)
+ 		buf->f_flags = calculate_f_flags(path->mnt);
++#ifdef CONFIG_MOUNTZERO
++	mountzero_spoof_statfs(path, buf);
++#endif
+ 	return error;
+ }
+ EXPORT_SYMBOL(vfs_statfs);
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index xxxxxxx..xxxxxxx 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -347,6 +347,10 @@
+ 		   MAJOR(dev), MINOR(dev), ino);
+ }
+ 
++#ifdef CONFIG_MOUNTZERO
++extern bool mountzero_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino);
++#endif
++
+ static void
+ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
+ {
+@@ -363,6 +367,9 @@
+ 		struct inode *inode = file_inode(vma->vm_file);
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
++#ifdef CONFIG_MOUNTZERO
++		mountzero_spoof_mmap_metadata(inode, &dev, &ino);
++#endif
+ 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+ 	}

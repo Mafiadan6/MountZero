@@ -2,12 +2,16 @@
 #
 # MountZero Integration Script
 # Run from your kernel source root directory
-# Usage: ./project/integrate.sh
+# Usage: ./project/integrate.sh [--patch]
+#
+# Without --patch: copies files directly (for already-patched kernels)
+# With --patch:    applies the kernel patch via git apply
 #
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(pwd)"
 MZ_KERNEL="$SCRIPT_DIR/kernel"
+PATCH_DIR="$MZ_KERNEL/patches"
 
 echo "========================================"
 echo "  MountZero VFS Integration"
@@ -20,88 +24,102 @@ if [ ! -d "$KERNEL_DIR/fs" ]; then
     exit 1
 fi
 
-# Check MountZero files exist
-if [ ! -f "$MZ_KERNEL/mountzero.c" ]; then
-    echo "❌ MountZero kernel files not found!"
-    echo "   Expected: $MZ_KERNEL/mountzero.c"
-    exit 1
+# Detect kernel version for patch selection
+KVER=$(make kernelversion 2>/dev/null)
+if [ -z "$KVER" ]; then
+    echo "⚠️  Cannot detect kernel version, assuming 4.14"
+    KVER="4.14.0"
 fi
+KMAJOR=$(echo "$KVER" | cut -d. -f1)
+KMINOR=$(echo "$KVER" | cut -d. -f2)
+PATCH_NAME="mountzero_${KMAJOR}.${KMINOR}_kernel_integration.patch"
 
-echo ""
-echo "Checking kernel configuration..."
+echo "  Kernel version: $KVER"
 
-# Check for SUSFS (required!)
+# Check for SUSFS
 if [ -f "$KERNEL_DIR/include/linux/susfs_def.h" ] || \
    grep -q "CONFIG_KSU_SUSFS" "$KERNEL_DIR"/*/defconfig 2>/dev/null || \
    grep -q "CONFIG_KSU_SUSFS" "$KERNEL_DIR"/arch/*/configs/* 2>/dev/null; then
-    echo "  ✅ SUSFS found in kernel"
+    echo "  ✅ SUSFS found"
 else
-    echo "  ⚠️  WARNING: SUSFS not detected in kernel config"
-    echo "           MountZero requires CONFIG_KSU_SUSFS=y"
-    echo "           Build may fail if SUSFS is not integrated."
+    echo "  ⚠️  WARNING: SUSFS not detected (CONFIG_KSU_SUSFS=y required)"
 fi
 
-echo ""
-echo "📁 Copying kernel files..."
-
-# Copy source files
-cp -v "$MZ_KERNEL/mountzero.c" "$KERNEL_DIR/fs/"
-cp -v "$MZ_KERNEL/mountzero_vfs.c" "$KERNEL_DIR/fs/"
-echo "  ✅ fs/mountzero.c"
-
-# Copy header files
-cp -v "$MZ_KERNEL/"mountzero*.h "$KERNEL_DIR/include/linux/"
-echo "  ✅ include/linux/mountzero*.h"
-
-# Add to Makefile
-if ! grep -q "mountzero.o" "$KERNEL_DIR/fs/Makefile" 2>/dev/null; then
-    echo "" >> "$KERNEL_DIR/fs/Makefile"
-    echo "obj-y += mountzero.o mountzero_vfs.o" >> "$KERNEL_DIR/fs/Makefile"
-    echo "  ✅ Added to fs/Makefile"
-else
-    echo "  ⏭️  Already in fs/Makefile"
-fi
-
-# Add to Kconfig if exists
-if [ -f "$KERNEL_DIR/fs/Kconfig" ]; then
-    if ! grep -q "config MOUNTZERO" "$KERNEL_DIR/fs/Kconfig" 2>/dev/null; then
-        echo "" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "config MOUNTZERO" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "    bool \"MountZero VFS\"" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "    depends on KSU_SUSFS" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "    default y" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "    help" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "      VFS path redirection for modules" >> "$KERNEL_DIR/fs/Kconfig"
-        echo "  ✅ Added to fs/Kconfig"
-    else
-        echo "  ⏭️  Already in fs/Kconfig"
+if [ "$1" = "--patch" ]; then
+    echo ""
+    echo "🔧 Applying patch: $PATCH_NAME"
+    
+    PATCH_FILE="$PATCH_DIR/$PATCH_NAME"
+    if [ ! -f "$PATCH_FILE" ]; then
+        echo "❌ Patch not found: $PATCH_FILE"
+        echo "   Available patches:"
+        ls "$PATCH_DIR/" 2>/dev/null
+        exit 1
     fi
+    
+    # Check if already patched
+    if grep -q "CONFIG_MOUNTZERO" "$KERNEL_DIR/fs/Kconfig" 2>/dev/null; then
+        echo "  ⏭️  Already patched (CONFIG_MOUNTZERO found in Kconfig)"
+    else
+        git apply --check "$PATCH_FILE" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            git apply "$PATCH_FILE"
+            echo "  ✅ Patch applied successfully"
+        else
+            echo "⚠️  git apply failed, trying with --reject..."
+            git apply --reject "$PATCH_FILE" 2>&1
+            echo "  ⚠️  Check for .rej files if there were conflicts"
+        fi
+    fi
+else
+    echo ""
+    echo "📁 Copying kernel files..."
+    
+    # Check MountZero files exist
+    if [ ! -f "$MZ_KERNEL/mountzero.c" ]; then
+        echo "❌ MountZero kernel files not found!"
+        exit 1
+    fi
+    
+    cp -v "$MZ_KERNEL/mountzero.c" "$KERNEL_DIR/fs/"
+    cp -v "$MZ_KERNEL/mountzero.h" "$KERNEL_DIR/include/linux/"
+    
+    # Add to Makefile
+    if ! grep -q "mountzero.o" "$KERNEL_DIR/fs/Makefile" 2>/dev/null; then
+        echo "" >> "$KERNEL_DIR/fs/Makefile"
+        echo "obj-y += mountzero.o" >> "$KERNEL_DIR/fs/Makefile"
+        echo "  ✅ Added to fs/Makefile"
+    fi
+    
+    # Add to Kconfig
+    if [ -f "$KERNEL_DIR/fs/Kconfig" ]; then
+        if ! grep -q "config MOUNTZERO" "$KERNEL_DIR/fs/Kconfig" 2>/dev/null; then
+            echo "" >> "$KERNEL_DIR/fs/Kconfig"
+            echo "config MOUNTZERO" >> "$KERNEL_DIR/fs/Kconfig"
+            echo -e "\tbool \"MountZero VFS Path Redirection\"" >> "$KERNEL_DIR/fs/Kconfig"
+            echo -e "\tdefault y" >> "$KERNEL_DIR/fs/Kconfig"
+            echo -e "\thelp" >> "$KERNEL_DIR/fs/Kconfig"
+            echo -e "\t  VFS path redirection, directory hiding," >> "$KERNEL_DIR/fs/Kconfig"
+            echo -e "\t  and mmap spoofing for systemless modules." >> "$KERNEL_DIR/fs/Kconfig"
+            echo "  ✅ Added to fs/Kconfig"
+        fi
+    fi
+    
+    echo ""
+    echo "⚠️  Manual: Add hooks to namei.c, dcache.c, readdir.c,"
+    echo "   stat.c, statfs.c, proc/task_mmu.c"
+    echo "   (See kernel/patches/ for exact hook points)"
 fi
 
 echo ""
 echo "========================================"
-echo "⚠️  MANUAL STEP REQUIRED:"
+echo "  Next steps:"
 echo "========================================"
 echo ""
-echo "1. Edit fs/namei.c:"
-echo "   Find getname_flags() function"
-echo "   Add these lines BEFORE 'return result;':"
-echo ""
-echo "   #ifdef CONFIG_MOUNTZERO"
-echo "   #include <linux/mountzero_vfs.h>"
-echo "   result = mountzero_vfs_getname_hook(result);"
-echo "   #endif"
-echo ""
-echo "2. Add to your defconfig:"
-echo "   CONFIG_MOUNTZERO=y"
-echo ""
-echo "   ⚠️  Also ensure: CONFIG_KSU_SUSFS=y"
-echo ""
-echo "3. Build:"
-echo "   make -j$(nproc)"
-echo ""
-echo "4. Flash boot.img + install module.zip"
+echo "  1. Add to defconfig:  CONFIG_MOUNTZERO=y"
+echo "  2. Build:             make -j\$(nproc)"
+echo "  3. Flash boot.img + install module.zip"
 echo ""
 echo "========================================"
-echo "✅ Integration files copied!"
+echo "✅ Done!"
 echo "========================================"

@@ -46,20 +46,24 @@ emulateVoldAppData = false
 autoHideApk = false
 autoHideFonts = false
 autoHideRootedFolders = false
-hideSusMounts = false
+hideSusMounts = true
 forceHideLsposed = false
-spoofCmdline = false
-hideKsuLoops = false
-propSpoofing = false
-autoHideInjections = false
-toggle = false
+spoofCmdline = true
+hideKsuLoops = true
+propSpoofing = true
+autoHideInjections = true
+toggle = true
 hideAndroidData = false
-hideModuleInjections = false
-zygiskAutoScan = false
-hideRecovery = false
-cleanupLeftovers = false
+hideModuleInjections = true
+zygiskAutoScan = true
+hideRecovery = true
+cleanupLeftovers = true
 inotifyWatcher = false
 selinuxEnforce = false
+nonStandardSdcardPathsHiding = true
+nonStandardSdcardAndroidPathsHiding = true
+unameSpoofing = true
+avcLogSpoofing = true
 
 [guard]
 enabled = true
@@ -234,11 +238,95 @@ sync_device_props() {
     config_set "brene" "vbmeta_size" "$vbmeta_size"
 }
 
+# Sync TOML config to BRENE-style shell config
+sync_brene_config() {
+    local BRENE_FILE="$CONFIG_DIR/config_brene.sh"
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$BRENE_FILE" << 'BRENECONF'
+# Auto-generated from config.toml - DO NOT EDIT MANUALLY
+BRENECONF
+
+    # Read each TOML value and map to BRENE variable
+    local val
+
+    val=$(config_get "brene" "nonStandardSdcardPathsHiding" "false")
+    echo "config_paths_hiding__non_standard_sdcard=$([ "$val" = "true" ] && echo 1 || echo 0)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "nonStandardSdcardAndroidPathsHiding" "false")
+    echo "config_paths_hiding__non_standard_sdcard_android=$([ "$val" = "true" ] && echo 1 || echo 0)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "hideAndroidData" "false")
+    echo "config_paths_hiding__data_local_tmp=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "hideAndroidData" "false")
+    echo "config_paths_hiding__sdcard_android_data_media_obb=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "selinuxEnforce" "false")
+    echo "config_selinux=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_su_compat=1" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "unameSpoofing" "false")
+    echo "config_spoof_uname=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_selinux_hide=1" >> "$BRENE_FILE"
+    echo "config_kernel_umount=1" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "hideModuleInjections" "false")
+    echo "config_hide_injections=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_hide_suspicious_pty=1" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "hideRecovery" "false")
+    echo "config_hide_custom_recovery=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "avcLogSpoofing" "false")
+    echo "config_enable_avc_log_spoofing=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "hideSusMounts" "false")
+    echo "config_umount_suspicious_mounts=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_hide_sus_mnts_for_non_su_procs=1" >> "$BRENE_FILE"
+    echo "config_fix_data_local_tmp_inconsistencies=1" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "propSpoofing" "false")
+    echo "config_spoof_system_properties=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_spoof_system_properties_repeat=0" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "spoofCmdline" "false")
+    echo "config_spoof_cmdline_or_bootconfig=$([ "$val" = "true" ] && echo 1 || echo 1)" >> "$BRENE_FILE"
+
+    echo "config_hide_addon_d=0" >> "$BRENE_FILE"
+    echo "config_enable_log=0" >> "$BRENE_FILE"
+    echo "config_pif_props=0" >> "$BRENE_FILE"
+    echo "config_rom_props=0" >> "$BRENE_FILE"
+    echo "config_saturation=0" >> "$BRENE_FILE"
+    echo "config_brene_logs=0" >> "$BRENE_FILE"
+    echo "config_usb_debugging=0" >> "$BRENE_FILE"
+    echo "config_developer_options=0" >> "$BRENE_FILE"
+    echo "config_custom_spoof_uname=0" >> "$BRENE_FILE"
+    echo "config_wireless_debugging=0" >> "$BRENE_FILE"
+    echo "config_hide_lineage_strings=0" >> "$BRENE_FILE"
+    echo "config_spoof_libstagefright=0" >> "$BRENE_FILE"
+    echo "config_hide_custom_rom_paths=0" >> "$BRENE_FILE"
+    echo "config_hide_framework_res_apk=0" >> "$BRENE_FILE"
+
+    val=$(config_get "brene" "verifiedBootHash" "")
+    echo "config_spoof_verified_boot_hash='$val'" >> "$BRENE_FILE"
+    echo "config_custom_uname_kernel_release='default'" >> "$BRENE_FILE"
+    echo "config_custom_uname_kernel_version='default'" >> "$BRENE_FILE"
+
+    chmod 600 "$BRENE_FILE"
+}
+
 # Main
 case "$1" in
     init)
         init_config
         sync_device_props
+        sync_brene_config
         echo "Config initialized"
         ;;
     get)

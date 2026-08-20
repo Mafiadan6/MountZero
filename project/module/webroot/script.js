@@ -13,19 +13,33 @@
    * Command Runner
    * ============================================================ */
 
-  async function runCmd(cmd) {
+  async function runCmd(cmd, timeoutMs) {
+    var timeout = timeoutMs || 10000;
     try {
       if (typeof exec === 'function') {
-        const result = await exec(cmd, {});
+        var result = await Promise.race([
+          exec(cmd, {}),
+          new Promise(function (resolve) { setTimeout(function () { resolve({ stdout: '', stderr: 'TIMEOUT' }); }, timeout); })
+        ]);
         return (result.stdout || '') + (result.stderr || '');
       } else if (typeof ksu !== 'undefined' && typeof ksu.exec === 'function') {
         return new Promise((resolve) => {
-          const cbName = 'mzcb_' + Date.now();
+          var resolved = false;
+          var cbName = 'mzcb_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
           window[cbName] = (errno, stdout, stderr) => {
+            if (resolved) return;
+            resolved = true;
             resolve((stdout || '') + (stderr || ''));
             delete window[cbName];
           };
           ksu.exec(cmd, '{}', cbName);
+          setTimeout(function () {
+            if (!resolved) {
+              resolved = true;
+              resolve('TIMEOUT');
+              delete window[cbName];
+            }
+          }, timeout);
         });
       }
     } catch (e) {
@@ -34,20 +48,13 @@
     return 'KernelSU bridge not available';
   }
 
+  var _mzctlPath = null;
   async function runMZ(args) {
-    /* Try module bin first (guaranteed to exist), then KSU PATH, then manager dirs */
-    var paths = [
-      '/data/adb/modules/mountzero_vfs/bin/mzctl',
-      '/data/adb/modules/mountzero_vfs/system/bin/mzctl'
-    ];
-    for (var i = 0; i < paths.length; i++) {
-      var r = await runCmd('test -x "' + paths[i] + '" && echo YES || echo NO');
-      if (r.indexOf('YES') !== -1) {
-        return await runCmd(paths[i] + ' ' + args + ' 2>&1');
-      }
+    if (!_mzctlPath) {
+      var probe = await runCmd('for p in /data/adb/ksu/bin/mzctl /data/adb/modules/mountzero_vfs/bin/mzctl /data/adb/modules/mountzero_vfs/system/bin/mzctl; do test -x "$p" && echo "$p" && break; done', 8000);
+      _mzctlPath = probe.trim().split('\n').pop() || 'mzctl';
     }
-    /* Fallback to KSU auto-symlink or manager dirs */
-    return await runCmd('(which mzctl 2>/dev/null || echo /data/adb/ksu/bin/mzctl) ' + args + ' 2>&1');
+    return await runCmd(_mzctlPath + ' ' + args + ' 2>&1', 15000);
   }
 
   /* ============================================================
@@ -63,13 +70,14 @@
       document.getElementById(tabId).classList.add('active');
 
       switch (tab.dataset.tab) {
-        case 'status':  loadStatus();  break;
-        case 'modules': loadModules(); break;
-        case 'rules':   loadRules();   break;
-        case 'config':  loadConfig();  break;
-        case 'guard':   loadGuard();   break;
-        case 'hiding':  loadHidingConfig(); break;
-        case 'tools':   loadBBRStatus(); break;
+        case 'status':    loadStatus();    break;
+        case 'modules':   loadModules();   break;
+        case 'rules':     loadRules();     break;
+        case 'config':    loadConfig();    break;
+        case 'guard':     loadGuard();     break;
+        case 'exclusions': loadExclusions(); break;
+        case 'hiding':    loadHidingConfig(); break;
+        case 'tools':     loadBBRStatus(); break;
       }
     });
   });
@@ -115,7 +123,7 @@
   async function loadStatus() {
     try {
       var status = await runMZ('status');
-      var isEnabled = status.indexOf('ENABLED') !== -1;
+      var isEnabled = status.toUpperCase().indexOf('ENABLED') !== -1;
 
       var badge = document.getElementById('status-badge');
       badge.textContent = isEnabled ? 'Active' : 'Inactive';
@@ -138,7 +146,7 @@
 
       // Count rules from list
       var rulesOutput = await runMZ('list');
-      var ruleLines = rulesOutput.split('\n').filter(function (l) { return l.indexOf('REDIRECT:') === 0; });
+      var ruleLines = rulesOutput.split('\n').filter(function (l) { return l.indexOf('REDIRECT:') === 0 && l.indexOf('REDIRECT: none') === -1 && l.indexOf(' -> ') !== -1; });
       var uniqueRules = new Set(ruleLines);
       var ruleCount = uniqueRules.size;
 
@@ -207,12 +215,23 @@
         selinuxEl.style.color = selinux === 'Enforcing' ? 'var(--danger)' : 'var(--neon-green)';
       }
 
-      // Capabilities — use mzctl detect exactly as original
+      // Capabilities
       var detect = await runMZ('detect');
       var capVfs     = detect.indexOf('VFS driver:     AVAILABLE') !== -1 ? 'Available' : 'Not Available';
-      var capSusfs   = detect.indexOf('SUSFS:          AVAILABLE') !== -1 ? 'Available' : 'Not Available';
       var capOverlay = detect.indexOf('OverlayFS:      AVAILABLE') !== -1 ? 'Available' : 'Not Available';
       var capErofs   = detect.indexOf('EROFS:          AVAILABLE') !== -1 ? 'Available' : 'Not Available';
+
+      // SUSFS — use binary, not sysfs
+      var susfsBinCheck = await runCmd('for b in /data/adb/ksu/bin/ksu_susfs /data/adb/modules/mountzero_vfs/bin/susfs /data/adb/ksu/bin/susfs; do test -x "$b" && echo "$b" && break; done', 8000);
+      var susfsBin = susfsBinCheck.trim();
+      var capSusfs = 'Not Available';
+      if (susfsBin) {
+        var ver = await runCmd(susfsBin + ' show version 2>/dev/null', 8000);
+        if (ver && ver.trim() && ver.trim() !== '--') {
+          capSusfs = 'Available';
+          setText('engine-driver', ver.trim());
+        }
+      }
 
       setNeonColor('cap-vfs',     capVfs,     'Available');
       setNeonColor('cap-susfs',   capSusfs,   'Available');
@@ -294,7 +313,7 @@
     var list = document.getElementById('rule-list');
     list.innerHTML = '';
 
-    var lines = output.split('\n').filter(function (l) { return l.startsWith('REDIRECT:'); });
+    var lines = output.split('\n').filter(function (l) { return l.indexOf('REDIRECT:') === 0 && l.indexOf('REDIRECT: none') === -1; });
     if (lines.length === 0) {
       list.innerHTML = '<div class="list-empty">No active rules</div>';
       return;
@@ -331,25 +350,37 @@
     list.querySelectorAll('.btn-icon').forEach(function (btn) {
       btn.addEventListener('click', async function () {
         var virt = btn.dataset.virt;
-        var result = await runMZ('del "' + virt + '"');
-        showToast(result.trim());
-        loadRules();
+        btn.disabled = true;
+        try {
+          var result = await runMZ('del "' + virt.replace(/"/g, '') + '"');
+          showToast(result.trim() || 'Rule deleted');
+        } catch (e) {
+          showToast('Error deleting rule');
+        }
+        await loadRules();
       });
     });
   }
 
   document.getElementById('btn-add-rule').addEventListener('click', async function () {
+    var btn = this;
     var virt = document.getElementById('rule-virt').value.trim();
     var real = document.getElementById('rule-real').value.trim();
     if (!virt || !real) {
       showToast('Both paths are required');
       return;
     }
-    var result = await runMZ('add "' + virt + '" "' + real + '"');
-    showToast(result.trim());
-    document.getElementById('rule-virt').value = '';
-    document.getElementById('rule-real').value = '';
-    loadRules();
+    btn.disabled = true;
+    try {
+      var result = await runMZ('add "' + virt.replace(/"/g, '') + '" "' + real.replace(/"/g, '') + '"');
+      showToast(result.trim() || 'Rule added');
+      document.getElementById('rule-virt').value = '';
+      document.getElementById('rule-real').value = '';
+      await loadRules();
+    } catch (e) {
+      showToast('Error adding rule');
+    }
+    btn.disabled = false;
   });
 
   document.getElementById('btn-clear-rules').addEventListener('click', async function () {
@@ -432,12 +463,8 @@
   setTimeout(loadMemGuardStatus, 2500);
 
   /* Hardcoded default spoofed uname values (stock-looking kernel version) */
-  var DEFAULT_SPOOFED_RELEASE = '5.15.196-g5a9c3d7e6f2b';
-  /* Auto-generate version with current date to look realistic */
-  var _d = new Date();
-  var _days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  var _months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  var DEFAULT_SPOOFED_VERSION = '#1 SMP PREEMPT ' + _days[_d.getDay()] + ' ' + _months[_d.getMonth()] + ' ' + String(_d.getDate()).padStart(2,'0') + ' ' + String(_d.getHours()).padStart(2,'0') + ':' + String(_d.getMinutes()).padStart(2,'0') + ':' + String(_d.getSeconds()).padStart(2,'0') + ' UTC ' + _d.getFullYear();
+  var DEFAULT_SPOOFED_RELEASE = '4.14.194-g5a9c3d7e6f2b';
+  var DEFAULT_SPOOFED_VERSION = '#1 SMP PREEMPT Thu Jan 15 03:42:17 UTC 2025';
 
   /* Pre-fill input fields with hardcoded defaults */
   document.getElementById('cfg-uname-release').value = DEFAULT_SPOOFED_RELEASE;
@@ -754,28 +781,30 @@
         return def;
       };
 
-      document.getElementById('cfg-hide-injections').checked = getVal('brene', 'autoHideInjections', 'true') === 'true';
-      document.getElementById('cfg-hide-tmp').checked = getVal('brene', 'hideDataLocalTmp', 'true') === 'true';
-      document.getElementById('cfg-hide-zygisk-modules').checked = getVal('brene', 'hideZygiskModules', 'true') === 'true';
-      document.getElementById('cfg-hide-sus-mounts').checked = getVal('brene', 'hideSusMounts', 'true') === 'true';
+      document.getElementById('cfg-hide-injections').checked = getVal('ghost', 'autoHideInjections', 'true') === 'true';
+      document.getElementById('cfg-hide-tmp').checked = getVal('ghost', 'hideDataLocalTmp', 'true') === 'true';
+      document.getElementById('cfg-hide-zygisk-modules').checked = getVal('ghost', 'hideZygiskModules', 'true') === 'true';
+      document.getElementById('cfg-hide-sus-mounts').checked = getVal('ghost', 'hideSusMounts', 'true') === 'true';
       document.getElementById('cfg-avc-spoof').checked = getVal('susfs', 'avcLogSpoofing', 'false') === 'true';
-      document.getElementById('cfg-cmdline-spoof').checked = getVal('brene', 'spoofCmdline', 'true') === 'true';
-      document.getElementById('cfg-prop-spoof').checked = getVal('brene', 'propSpoofing', 'true') === 'true';
-      document.getElementById('cfg-hide-sdcard').checked = getVal('brene', 'nonStandardSdcardPathsHiding', 'false') === 'true';
-      document.getElementById('cfg-hide-sdcard-android').checked = getVal('brene', 'nonStandardSdcardAndroidPathsHiding', 'false') === 'true';
-      document.getElementById('cfg-kernel-umount').checked = getVal('brene', 'kernelUmount', 'true') === 'true';
-      document.getElementById('cfg-uname-spoof').checked = getVal('brene', 'unameSpoofing', 'true') === 'true';
-      document.getElementById('cfg-selinux').checked = getVal('brene', 'selinux', 'true') === 'true';
-      document.getElementById('cfg-hide-modules-img').checked = getVal('brene', 'hideModulesImg', 'false') === 'true';
-      document.getElementById('cfg-hide-android-data').checked = getVal('brene', 'hideAndroidData', 'false') === 'true';
-      document.getElementById('cfg-hide-module-injections').checked = getVal('brene', 'hideModuleInjections', 'false') === 'true';
-      document.getElementById('cfg-zygisk-auto-scan').checked = getVal('brene', 'zygiskAutoScan', 'false') === 'true';
-      document.getElementById('cfg-hide-recovery').checked = getVal('brene', 'hideRecovery', 'false') === 'true';
-      document.getElementById('cfg-cleanup-leftovers').checked = getVal('brene', 'cleanupLeftovers', 'false') === 'true';
-      document.getElementById('cfg-inotify-watcher').checked = getVal('brene', 'inotifyWatcher', 'false') === 'true';
-      document.getElementById('cfg-selinux-enforce').checked = getVal('brene', 'selinuxEnforce', 'false') === 'true';
+      document.getElementById('cfg-cmdline-spoof').checked = getVal('ghost', 'spoofCmdline', 'true') === 'true';
+      document.getElementById('cfg-prop-spoof').checked = getVal('ghost', 'propSpoofing', 'true') === 'true';
+      document.getElementById('cfg-hide-sdcard').checked = getVal('ghost', 'nonStandardSdcardPathsHiding', 'false') === 'true';
+      document.getElementById('cfg-hide-sdcard-android').checked = getVal('ghost', 'nonStandardSdcardAndroidPathsHiding', 'false') === 'true';
+      document.getElementById('cfg-hide-lsposed').checked = getVal('ghost', 'hideLsposed', 'false') === 'true';
+      document.getElementById('cfg-hide-loops').checked = getVal('ghost', 'hideLoops', 'true') === 'true';
+      document.getElementById('cfg-kernel-umount').checked = getVal('ghost', 'kernelUmount', 'true') === 'true';
+      document.getElementById('cfg-uname-spoof').checked = getVal('ghost', 'unameSpoofing', 'true') === 'true';
+      document.getElementById('cfg-selinux').checked = getVal('ghost', 'selinux', 'true') === 'true';
+      document.getElementById('cfg-hide-modules-img').checked = getVal('ghost', 'hideModulesImg', 'false') === 'true';
+      document.getElementById('cfg-hide-android-data').checked = getVal('ghost', 'hideAndroidData', 'false') === 'true';
+      document.getElementById('cfg-hide-module-injections').checked = getVal('ghost', 'hideModuleInjections', 'false') === 'true';
+      document.getElementById('cfg-zygisk-auto-scan').checked = getVal('ghost', 'zygiskAutoScan', 'false') === 'true';
+      document.getElementById('cfg-hide-recovery').checked = getVal('ghost', 'hideRecovery', 'true') === 'true';
+      document.getElementById('cfg-cleanup-leftovers').checked = getVal('ghost', 'cleanupLeftovers', 'false') === 'true';
+      document.getElementById('cfg-inotify-watcher').checked = getVal('ghost', 'inotifyWatcher', 'false') === 'true';
+      document.getElementById('cfg-selinux-enforce').checked = getVal('ghost', 'selinuxEnforce', 'false') === 'true';
 
-      var vbh = getVal('brene', 'verifiedBootHash', '');
+      var vbh = getVal('ghost', 'verifiedBootHash', '');
       if (vbh && vbh !== '""') document.getElementById('cfg-vbh').value = vbh;
 
       var customPaths = await runCmd('cat /data/adb/mountzero/custom_sus_path.txt 2>/dev/null');
@@ -831,15 +860,17 @@
       var cleanupLeftovers = document.getElementById('cfg-cleanup-leftovers').checked;
       var inotifyWatcher = document.getElementById('cfg-inotify-watcher').checked;
       var selinuxEnforce = document.getElementById('cfg-selinux-enforce').checked;
+      var hideLsposed = document.getElementById('cfg-hide-lsposed').checked;
+      var hideLoops = document.getElementById('cfg-hide-loops').checked;
       var vbh = document.getElementById('cfg-vbh').value.trim();
 
       var existingConfig = await runCmd('cat ' + configDir + '/config.toml 2>/dev/null');
       if (!existingConfig || existingConfig.includes('No such file')) {
-        showToast('Config not found — run mzctl enable first');
-        return;
+        await runCmd('mkdir -p ' + configDir);
+        existingConfig = '';
       }
 
-      var breneSection = '[brene]\n' +
+      var ghostSection = '[ghost]\n' +
         'verifiedBootHash = "' + vbh + '"\n' +
         'kernelUmount = ' + kernelUmount + '\n' +
         'autoHideInjections = ' + hideInjections + '\n' +
@@ -860,12 +891,14 @@
         'hideRecovery = ' + hideRecovery + '\n' +
         'cleanupLeftovers = ' + cleanupLeftovers + '\n' +
         'inotifyWatcher = ' + inotifyWatcher + '\n' +
-        'selinuxEnforce = ' + selinuxEnforce;
+        'selinuxEnforce = ' + selinuxEnforce + '\n' +
+        'hideLsposed = ' + hideLsposed + '\n' +
+        'hideLoops = ' + hideLoops;
 
       var mountSection = "[mount]\nmountEngine = \"vfs\"\npartitions = [\"product\", \"system_ext\", \"vendor\"]\nselinux_spoof = true\nhide_mounts = true";
       var susfsSection = "[susfs]\nenabled = true\npathHide = true\nmapsHide = true\nkstat = true\nsusfsLog = false\navcLogSpoofing = false";
       var adbSection = "[adb]\nroot = false";
-      var fullConfig = mountSection + "\n\n" + susfsSection + "\n\n" + breneSection + "\n\n" + adbSection + "\n";
+      var fullConfig = mountSection + "\n\n" + susfsSection + "\n\n" + ghostSection + "\n\n" + adbSection + "\n";
       await runCmd("mkdir -p " + configDir + " && echo '" + fullConfig.replace(/'/g, "'\\''") + "' > " + configDir + "/config.toml");
 
       var hidingSh = '/data/adb/modules/mountzero_vfs/hiding.sh';
@@ -908,6 +941,258 @@
   });
 
   document.getElementById('btn-refresh-logs').addEventListener('click', loadHidingLogs);
+
+  /* ============================================================
+   * Exclusions Tab — UID-based app exclusion manager
+   * ============================================================ */
+
+  var MZ_DATA = '/data/adb/mountzero';
+  var EXCLUSION_FILE = MZ_DATA + '/.exclusion_list';
+  var APP_ICON_FALLBACK = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzgwODA4MCI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40IDEwLTEwUzE3LjUyIDIgMTIgMnptMThjLTQuNDEgMC04LTMuNTktOC04czMuNTktOCA4LTggOCAzLTLuNDkgOC04eiIvPjwvc3ZnPg==";
+  var allAppsCache = [];
+  var appLoadingPromise = null;
+  var showSystemApps = false;
+
+  function parseUidList(text) {
+    return String(text || '').split(/[\s,]+/).map(function (s) {
+      return s.trim();
+    }).filter(function (s) {
+      return /^\d+$/.test(s);
+    });
+  }
+
+  function normalizeUidList(uids) {
+    var seen = {};
+    return uids.filter(function (uid) {
+      var s = String(uid || '').trim();
+      if (!/^\d+$/.test(s)) return false;
+      if (seen[s]) return false;
+      seen[s] = true;
+      return true;
+    });
+  }
+
+  function buildWriteUidListCmd(uids) {
+    var safe = normalizeUidList(uids);
+    var tempFile = EXCLUSION_FILE + '.tmp';
+    var write = safe.length > 0
+      ? 'printf \'%s\\n\' ' + safe.join(' ')
+      : ':';
+    return 'mkdir -p ' + MZ_DATA + ' && { ' + write + ' > ' + tempFile + ' && mv -f ' + tempFile + ' ' + EXCLUSION_FILE + '; }';
+  }
+
+  async function ensureAppsCache() {
+    if (allAppsCache.length > 0) return;
+    if (appLoadingPromise) { await appLoadingPromise; return; }
+    appLoadingPromise = (async function () {
+      try {
+        var ksuWait = 25;
+        while ((typeof ksu === 'undefined' || !ksu.listPackages) && ksuWait > 0) {
+          await new Promise(function (r) { setTimeout(r, 200); });
+          ksuWait--;
+        }
+        if (typeof ksu === 'undefined' || !ksu.listPackages) return;
+        var pkgsRaw = ksu.listPackages('all');
+        if (!pkgsRaw || pkgsRaw === '[]' || pkgsRaw === '') return;
+        var pkgs = JSON.parse(pkgsRaw);
+        var chunkSize = 200;
+        var tempCache = [];
+        for (var i = 0; i < pkgs.length; i += chunkSize) {
+          var chunkInfo = ksu.getPackagesInfo(JSON.stringify(pkgs.slice(i, i + chunkSize)));
+          if (chunkInfo) tempCache.push.apply(tempCache, JSON.parse(chunkInfo));
+          await new Promise(function (r) { setTimeout(r, 15); });
+        }
+        allAppsCache = tempCache.map(function (app) {
+          return Object.assign({}, app, {
+            appLabel: app.appLabel || app.packageName,
+            uid: String(app.uid),
+            _search: (app.appLabel || app.packageName).toLowerCase() + ' ' + app.packageName.toLowerCase()
+          });
+        }).sort(function (a, b) { return a.appLabel < b.appLabel ? -1 : a.appLabel > b.appLabel ? 1 : 0; });
+      } catch (e) { console.error('ensureAppsCache:', e); }
+      finally { appLoadingPromise = null; }
+    })();
+    return appLoadingPromise;
+  }
+
+  async function loadExclusions() {
+    var listEl = document.getElementById('exclusion-list');
+    if (!listEl) return;
+    try {
+      var readResult = await runCmd('cat ' + EXCLUSION_FILE + ' 2>/dev/null || echo ""');
+      var blockedUids = parseUidList(readResult);
+      if (blockedUids.length > 0) {
+        try { await ensureAppsCache(); } catch (e) {}
+      }
+      var appsMap = {};
+      allAppsCache.forEach(function (app) { appsMap[app.uid] = app; });
+
+      var countPill = document.getElementById('exclusion-count-pill');
+      if (countPill) countPill.textContent = blockedUids.length + ' app' + (blockedUids.length !== 1 ? 's' : '');
+
+      if (blockedUids.length === 0) {
+        listEl.innerHTML = '<div class="list-empty">No exclusions yet. Apps below will see the original filesystem.</div>';
+        return;
+      }
+
+      var html = '';
+      blockedUids.forEach(function (uid) {
+        var app = appsMap[uid];
+        var label = app ? app.appLabel : 'UID: ' + uid;
+        var pkg = app ? app.packageName : 'system';
+        html += '<div class="exclusion-item" data-uid="' + uid + '" data-label="' + escAttr(label) + '">' +
+          '<img src="ksu://icon/' + escAttr(pkg) + '" class="exclusion-app-icon" onerror="this.src=\'' + APP_ICON_FALLBACK + '\'" />' +
+          '<div class="exclusion-app-info">' +
+            '<div class="exclusion-app-name">' + escHtml(label) + '</div>' +
+            '<div class="exclusion-app-pkg">' + escHtml(pkg) + '</div>' +
+          '</div>' +
+          '<span class="exclusion-app-uid">UID:' + uid + '</span>' +
+          '<button class="exclusion-remove-btn" title="Remove exclusion">' +
+            '<svg viewBox="0 0 20 20" fill="none"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>' +
+          '</button>' +
+        '</div>';
+      });
+      listEl.innerHTML = html;
+    } catch (e) {
+      listEl.innerHTML = '<div class="list-empty">Error loading exclusions</div>';
+    }
+  }
+
+  async function addExclusion(uid, name) {
+    uid = normalizeUidList([uid])[0];
+    if (!uid) { showToast('Invalid UID'); return; }
+    try {
+      var readResult = await runCmd('cat ' + EXCLUSION_FILE + ' 2>/dev/null || echo ""');
+      var currentUids = parseUidList(readResult);
+      var alreadyBlocked = currentUids.indexOf(uid) !== -1;
+      if (!alreadyBlocked) {
+        currentUids.push(uid);
+        await runCmd(buildWriteUidListCmd(currentUids));
+      }
+      await runMZ('block ' + uid);
+      showToast(alreadyBlocked ? 'Already blocked' : 'Blocked: ' + name);
+    } catch (e) {
+      showToast('Error blocking app');
+    }
+    loadExclusions();
+  }
+
+  async function removeExclusion(uid, name) {
+    uid = normalizeUidList([uid])[0];
+    if (!uid) return;
+    try {
+      var readResult = await runCmd('cat ' + EXCLUSION_FILE + ' 2>/dev/null || echo ""');
+      var remaining = parseUidList(readResult).filter(function (v) { return v !== uid; });
+      await runCmd(buildWriteUidListCmd(remaining));
+      await runMZ('unblock ' + uid);
+      showToast('Unblocked: ' + name);
+    } catch (e) {
+      showToast('Error unblocking app');
+    }
+    loadExclusions();
+  }
+
+  function openAppSelector() {
+    var modal = document.getElementById('app-selector-modal');
+    var container = document.getElementById('app-list-container');
+    var searchInput = document.getElementById('app-search-input');
+    var sysSwitch = document.getElementById('switch-system-apps');
+    if (!modal) return;
+    modal.classList.add('active');
+    searchInput.value = '';
+    if (sysSwitch) sysSwitch.checked = showSystemApps;
+    container.innerHTML = '<div class="list-empty">Loading apps...</div>';
+
+    document.getElementById('btn-close-modal').onclick = function () {
+      modal.classList.remove('active');
+    };
+
+    setTimeout(async function () {
+      try {
+        await Promise.race([
+          ensureAppsCache(),
+          new Promise(function (_, reject) { setTimeout(function () { reject(new Error('timeout')); }, 8000); })
+        ]);
+        if (allAppsCache.length === 0) {
+          container.innerHTML = '<div class="list-empty">No apps found. KSU bridge may be unavailable.</div>';
+          return;
+        }
+        renderAppList('');
+        searchInput.oninput = function () { renderAppList(searchInput.value); };
+        if (sysSwitch) sysSwitch.onchange = function () { showSystemApps = sysSwitch.checked; renderAppList(searchInput.value); };
+      } catch (e) {
+        container.innerHTML = '<div class="list-empty">Failed to load apps (' + (e.message || 'error') + ')</div>';
+      }
+    }, 250);
+  }
+
+  function renderAppList(searchTerm) {
+    var term = (searchTerm || '').toLowerCase();
+    var container = document.getElementById('app-list-container');
+    if (!container) return;
+    var filtered = allAppsCache.filter(function (app) {
+      return app._search.indexOf(term) !== -1 && (showSystemApps || !app.isSystem);
+    });
+    if (filtered.length === 0) {
+      container.innerHTML = '<div class="list-empty">No apps match</div>';
+      return;
+    }
+    var html = filtered.map(function (app) {
+      return '<div class="app-select-item" data-uid="' + app.uid + '" data-label="' + escAttr(app.appLabel) + '">' +
+        '<img src="ksu://icon/' + escAttr(app.packageName) + '" class="app-select-icon" loading="lazy" onerror="this.src=\'' + APP_ICON_FALLBACK + '\'" />' +
+        '<div class="app-select-info">' +
+          '<div class="app-select-name">' + escHtml(app.appLabel) + '</div>' +
+          '<div class="app-select-pkg">' + escHtml(app.packageName) + '</div>' +
+        '</div>' +
+        '<span class="app-select-uid">UID:' + app.uid + '</span>' +
+        (app.isSystem ? '<span class="app-select-sys">SYS</span>' : '') +
+      '</div>';
+    }).join('');
+    container.innerHTML = html;
+  }
+
+  /* Event delegation — single listeners on containers, like NoMount */
+  document.getElementById('app-list-container').addEventListener('click', function (e) {
+    var item = e.target.closest('.app-select-item');
+    if (item && !item.dataset.busy) {
+      item.dataset.busy = '1';
+      var uid = item.dataset.uid;
+      var label = item.dataset.label;
+      document.getElementById('app-selector-modal').classList.remove('active');
+      setTimeout(function () { addExclusion(uid, label); }, 50);
+    }
+  });
+
+  document.getElementById('app-selector-modal').addEventListener('click', function (e) {
+    if (e.target === e.currentTarget) {
+      e.currentTarget.classList.remove('active');
+    }
+  });
+
+  document.getElementById('btn-add-exclusion').addEventListener('click', openAppSelector);
+
+  document.getElementById('btn-clear-exclusions').addEventListener('click', async function () {
+    if (!confirm('Clear all UID exclusions?')) return;
+    try {
+      await runCmd(buildWriteUidListCmd([]));
+      showToast('All exclusions cleared');
+    } catch (e) {
+      showToast('Error clearing exclusions');
+    }
+    loadExclusions();
+  });
+
+  document.getElementById('exclusion-list').addEventListener('click', function (e) {
+    var btn = e.target.closest('.exclusion-remove-btn');
+    if (!btn) return;
+    var item = btn.closest('.exclusion-item');
+    if (!item) return;
+    var uid = item.dataset.uid;
+    var label = item.dataset.label;
+    item.style.opacity = '0.4';
+    item.style.pointerEvents = 'none';
+    setTimeout(function () { removeExclusion(uid, label); }, 0);
+  });
 
   /* ============================================================
    * Toast Notifications
